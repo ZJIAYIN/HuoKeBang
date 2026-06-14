@@ -302,12 +302,15 @@ class MCPToolManager:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 3. 合并去重（按内容哈希去重）
+        # 3. 合并去重（优先按 chunk id 去重，无 id 时回退到内容哈希）
         seen, merged = set(), []
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
+                    if isinstance(item, dict):
+                        key = item.get("id") or hashlib.md5(str(item).encode()).hexdigest()
+                    else:
+                        key = hashlib.md5(str(item).encode()).hexdigest()
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)

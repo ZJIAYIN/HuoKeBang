@@ -227,6 +227,54 @@ class MemoryManager:
             summary=summary,
         )
 
+    def list_profiles(self) -> List[Dict[str, Any]]:
+        """返回所有用户画像的完整列表。"""
+        try:
+            result = self._profile.get()
+            items: List[Dict[str, Any]] = []
+            if result["documents"]:
+                for i in range(len(result["documents"])):
+                    meta = result["metadatas"][i] if result["metadatas"] and i < len(result["metadatas"]) else {}
+                    doc_text = result["documents"][i]
+                    profile_data = {}
+                    try:
+                        profile_data = json.loads(doc_text)
+                    except (json.JSONDecodeError, TypeError):
+                        profile_data = {"raw": doc_text}
+                    items.append({
+                        "id":          result["ids"][i] if result["ids"] and i < len(result["ids"]) else "",
+                        "user_id":     meta.get("user_id", ""),
+                        "conv_id":     meta.get("conv_id", ""),
+                        "timestamp":   meta.get("ts", ""),
+                        "preferences": profile_data.get("preferences", []),
+                        "entities":    profile_data.get("entities", {}),
+                    })
+            return items
+        except Exception as ex:
+            logger.warning(f"列出用户画像失败: {ex}")
+            return []
+
+    def list_episodic(self) -> List[Dict[str, Any]]:
+        """返回所有情景记忆的完整列表。"""
+        try:
+            result = self._episodic.get()
+            items: List[Dict[str, Any]] = []
+            if result["documents"]:
+                for i in range(len(result["documents"])):
+                    meta = result["metadatas"][i] if result["metadatas"] and i < len(result["metadatas"]) else {}
+                    items.append({
+                        "id":        result["ids"][i] if result["ids"] and i < len(result["ids"]) else "",
+                        "user_id":   meta.get("user_id", ""),
+                        "conv_id":   meta.get("conv_id", ""),
+                        "timestamp": meta.get("ts", ""),
+                        "summary":   result["documents"][i] if result["documents"] and i < len(result["documents"]) else "",
+                        "full_text": meta.get("full_text", "")[:500],
+                    })
+            return items
+        except Exception as ex:
+            logger.warning(f"列出情景记忆失败: {ex}")
+            return []
+
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
     async def _compress(self, user_id: str, conv_id: str) -> None:

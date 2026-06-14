@@ -52,7 +52,7 @@ _evaluator    = None
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
-    key = os.getenv("ANTHROPIC_API_KEY", "")
+    key = "sk-92f09f3ada494ecd8390763ff293906b"
     if not key:
         raise RuntimeError("未设置 ANTHROPIC_API_KEY")
     cfg: Dict[str, Any] = {
@@ -390,7 +390,8 @@ async def add_knowledge(body: BatchDocInput):
     """
     批量导入文档到知识库。
 
-    文档会自动切片（每片 500 字）并存入 ChromaDB，ChromaDB 内置 Embedding 模型自动向量化。
+    文档会自动切片（每片 500 字）并存入 ChromaDB / BM25 索引。
+    返回每篇文档的 doc_id，可用于后续按文档删除。
 
     示例请求体：
     ```json
@@ -406,8 +407,13 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
-    return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
+    result = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
+    return {
+        "message": f"成功导入 {result['added_chunks']} 个文档片段",
+        "added_chunks": result["added_chunks"],
+        "doc_ids": result["doc_ids"],
+        "total_chunks": kb.doc_count,
+    }
 
 
 @app.post("/knowledge/upload", tags=["知识库"])
@@ -416,6 +422,8 @@ async def upload_knowledge(file: UploadFile = File(...)):
     上传文件导入知识库。
 
     支持格式：
+    - `.pdf`：自动提取文本（pdfplumber）
+    - `.docx`：自动提取文本（python-docx）
     - `.txt` / `.md`：整个文件作为一篇文档，文件名作为标题
     - `.json`：JSON 数组格式 `[{"title": "...", "content": "..."}, ...]`
 
@@ -430,38 +438,238 @@ async def upload_knowledge(file: UploadFile = File(...)):
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件大小超过 10MB 限制")
 
-    text = content.decode("utf-8", errors="ignore")
     filename = file.filename or "unknown"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    title = filename.rsplit(".", 1)[0] if "." in filename else filename
 
-    if filename.endswith(".json"):
-        import json as _json
-        try:
-            docs = _json.loads(text)
-            if not isinstance(docs, list):
-                raise HTTPException(400, "JSON 文件应为数组格式: [{title, content}, ...]")
-        except _json.JSONDecodeError as e:
-            raise HTTPException(400, f"JSON 解析失败: {e}")
+    if ext == "pdf":
+        docs = _parse_pdf(content, title)
+    elif ext == "docx":
+        docs = _parse_docx(content, title)
+    elif ext == "json":
+        docs = _parse_json_upload(content)
     else:
         # txt / md：整个文件作为一篇文档
-        title = filename.rsplit(".", 1)[0] if "." in filename else filename
+        text = content.decode("utf-8", errors="ignore")
         docs = [{"title": title, "content": text}]
 
-    count = kb.add_documents(docs)
+    result = kb.add_documents(docs)
     return {
         "message": f"文件 {filename} 导入成功",
-        "added_chunks": count,
+        "added_chunks": result["added_chunks"],
+        "doc_ids": result["doc_ids"],
         "total_chunks": kb.doc_count,
+        "source_docs": len(docs),
     }
+
+
+def _parse_pdf(raw: bytes, title: str) -> List[Dict[str, str]]:
+    """用 pdfplumber 提取 PDF 文本 + 表格（表格转 markdown）。"""
+    import io
+
+    import pdfplumber
+
+    docs: List[Dict[str, str]] = []
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            parts: List[str] = []
+
+            # 1. 文本
+            text = page.extract_text()
+            if text and text.strip():
+                parts.append(text.strip())
+
+            # 2. 表格 → markdown
+            tables = page.extract_tables()
+            if tables:
+                for t in tables:
+                    md = _table_to_markdown(t)
+                    if md:
+                        parts.append(md)
+
+            if parts:
+                doc_title = f"{title}_p{i}" if len(pdf.pages) > 1 else title
+                docs.append({"title": doc_title, "content": "\n\n".join(parts)})
+
+    if not docs:
+        raise HTTPException(400, f"PDF 文件中未提取到文本内容")
+
+    logger.info(f"PDF 解析完成: {title} → {len(docs)} 页")
+    return docs
+
+
+def _parse_docx(raw: bytes, title: str) -> List[Dict[str, str]]:
+    """
+    用 python-docx 提取 Word 文档文本 + 表格（表格转 markdown）。
+
+    遍历 document body 保持段落和表格的原始顺序。
+    """
+    import io
+
+    from docx import Document
+
+    doc = Document(io.BytesIO(raw))
+    parts: List[str] = []
+
+    for child in doc.element.body:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+        if tag == "p":
+            # 段落
+            from docx.text.paragraph import Paragraph
+            para = Paragraph(child, doc)
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+
+        elif tag == "tbl":
+            # 表格 → markdown
+            from docx.table import Table
+            table = Table(child, doc)
+            rows: List[List[str]] = []
+            for row in table.rows:
+                rows.append([cell.text.strip() for cell in row.cells])
+            md = _table_to_markdown(rows)
+            if md:
+                parts.append(md)
+
+    if not parts:
+        raise HTTPException(400, f"Word 文档中未提取到文本内容")
+
+    content = "\n\n".join(parts)
+    logger.info(f"DOCX 解析完成: {title} → {len(parts)} 个内容块")
+    return [{"title": title, "content": content}]
+
+
+def _parse_json_upload(raw: bytes) -> List[Dict[str, str]]:
+    """解析 JSON 格式的知识库导入文件。"""
+    import json as _json
+
+    text = raw.decode("utf-8", errors="ignore")
+    try:
+        docs = _json.loads(text)
+        if not isinstance(docs, list):
+            raise HTTPException(400, "JSON 文件应为数组格式: [{title, content}, ...]")
+        return docs
+    except _json.JSONDecodeError as e:
+        raise HTTPException(400, f"JSON 解析失败: {e}")
+
+
+def _table_to_markdown(rows: List[List[Optional[str]]]) -> str:
+    """将二维表格转为 markdown table 字符串。"""
+    if not rows:
+        return ""
+
+    # 清洗：None → ""，strip
+    clean: List[List[str]] = [
+        [(cell or "").strip() for cell in row]
+        for row in rows
+    ]
+
+    # 过滤全空行
+    clean = [row for row in clean if any(cell for cell in row)]
+    if not clean:
+        return ""
+
+    n_cols = max(len(row) for row in clean)
+    # 补齐列数不一致的行
+    for row in clean:
+        while len(row) < n_cols:
+            row.append("")
+
+    # 计算列宽
+    col_widths = [0] * n_cols
+    for row in clean:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
+
+    lines: List[str] = []
+    for r_idx, row in enumerate(clean):
+        line = "| " + " | ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row)) + " |"
+        lines.append(line)
+        if r_idx == 0:
+            # 表头分隔线
+            sep = "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"
+            lines.append(sep)
+
+    return "\n".join(lines)
 
 
 @app.get("/knowledge/stats", tags=["知识库"])
 async def knowledge_stats():
-    """查看知识库统计信息（文档片段总数）。"""
+    """查看知识库统计信息（文档片段总数 + 父块数 + BM25 索引数）。"""
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    return {"total_chunks": kb.doc_count}
+    return {
+        "total_chunks": kb.doc_count,
+        "bm25_docs": kb.bm25_doc_count,
+    }
+
+
+@app.get("/knowledge/list", tags=["知识库"])
+async def knowledge_list():
+    """返回知识库中所有片段的完整列表（含全文）。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    chunks = kb.list_chunks()
+    return {
+        "total": len(chunks),
+        "chunks": chunks,
+    }
+
+
+@app.delete("/knowledge/{doc_id}", tags=["知识库"])
+async def knowledge_delete(doc_id: str):
+    """按文档 ID 删除一篇文档的所有 chunk（同步清理 ChromaDB + BM25）。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    deleted = kb.delete_by_doc_id(doc_id)
+    if deleted == 0:
+        raise HTTPException(404, f"文档 {doc_id} 不存在或已被删除")
+    return {
+        "message": f"文档 {doc_id} 已删除",
+        "deleted_chunks": deleted,
+        "total_chunks": kb.doc_count,
+    }
+
+
+@app.delete("/knowledge", tags=["知识库"])
+async def knowledge_clear():
+    """清空知识库所有文档（同步清理 ChromaDB + BM25 索引）。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+    deleted = kb.clear()
+    return {
+        "message": "知识库已清空",
+        "deleted_chunks": deleted,
+        "total_chunks": kb.doc_count,
+    }
+
+
+@app.get("/memory/profiles", tags=["记忆"])
+async def memory_profiles():
+    """返回所有用户画像的完整列表。"""
+    if _memory is None:
+        raise HTTPException(503, "记忆系统未初始化")
+    profiles = _memory.list_profiles()
+    return {"total": len(profiles), "profiles": profiles}
+
+
+@app.get("/memory/episodic", tags=["记忆"])
+async def memory_episodic():
+    """返回所有情景记忆的完整列表。"""
+    if _memory is None:
+        raise HTTPException(503, "记忆系统未初始化")
+    episodic = _memory.list_episodic()
+    return {"total": len(episodic), "episodic": episodic}
 
 
 @app.post("/eval/run")
