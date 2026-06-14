@@ -161,11 +161,18 @@ class MemoryManager:
             return
 
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in messages[-10:]))
-        prompt = f"""从以下对话中提炼用户偏好和关键实体，返回 JSON。
+        prompt = f"""从以下对话中提炼用户偏好、关键实体、情绪变化，返回 JSON。
 对话:
 {text}
 
-返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
+返回格式:
+{{
+  "preferences": ["..."],
+  "entities": {{"产品": [], "预算": [], "联系方式": []}},
+  "sentiment_history": [
+    {{"sentiment": "positive/neutral/skeptical/anxious/negative", "trigger": "触发这句话的原因", "round": 0}}
+  ]
+}}"""
         prompt = self._safe_text(prompt)
 
         try:

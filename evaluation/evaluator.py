@@ -477,14 +477,17 @@ class EndToEndEvaluator:
 # ── 内置测试用例（开箱即用）──────────────────────────────────────────────────
 
 DEFAULT_INTENT_CASES: List[IntentTestCase] = [
-    IntentTestCase("我的订单什么时候到？",       "query"),
-    IntentTestCase("帮我取消订单",               "request"),
-    IntentTestCase("你们服务太差了！",            "complaint"),
-    IntentTestCase("应用一直报500错误",           "technical"),
-    IntentTestCase("为什么扣了两次款？",          "billing"),
-    IntentTestCase("我要投诉，转人工！",          "escalation"),
     IntentTestCase("你好",                        "greeting"),
-    IntentTestCase("修改我的邮箱地址",            "account"),
+    IntentTestCase("你们产品有什么功能？",          "product_inq"),
+    IntentTestCase("多少钱一个月？",               "price_inq"),
+    IntentTestCase("我目前手上的预算是5000",        "price_inq"),
+    IntentTestCase("我要买，怎么下单？",            "purchase"),
+    IntentTestCase("你们服务太差了！",              "complaint"),
+    IntentTestCase("滚滚滚",                       "complaint"),
+    IntentTestCase("13712345678",                  "contact_give"),
+    IntentTestCase("不方便留电话",                  "contact_no"),
+    IntentTestCase("不好意思号码发错了",            "contact_fix"),
+    IntentTestCase("你是机器人吗？",                "chitchat"),
 ]
 
 DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [

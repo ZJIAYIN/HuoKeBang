@@ -5,10 +5,12 @@ EchoMind 智能客服系统 — FastAPI 入口
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
 """
 import asyncio
+import json
 import logging
 import os
 import pathlib
 import sys
+import time as _time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
@@ -89,11 +91,12 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
 
-    # Agent 编排器
+    # Agent 编排器（含留资能力）
     _orchestrator = AgentOrchestrator(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
+        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
     )
 
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
@@ -202,8 +205,10 @@ class ChatResponse(BaseModel):
     conv_id:     str
     response:    str
     intent:      str
+    sentiment:   str = "neutral"
     agent_type:  str
     escalated:   bool
+    ask_contact: bool = False
     latency_ms:  float
     knowledge_used: bool = False
 
@@ -220,12 +225,13 @@ async def health():
 async def chat(req: ChatRequest):
     """
     主对话接口。完整流程：
-      记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
+      记忆读取 → 意图识别 → (业务类意图 → RAG) → Agent 路由 → 执行 → 记忆写入
     """
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
     from agents.agent_orchestrator import Request as OrcReq
+    from core.intent_recognizer import IntentCategory
     from memory.conversation_memory import MsgRole
 
     conv_id = req.conv_id or str(uuid.uuid4())
@@ -233,42 +239,77 @@ async def chat(req: ChatRequest):
     # 1. 读取记忆上下文
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
-    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
+    # 2. 构建对话历史（供意图识别 + Agent 使用）
     history = [
         {"role": m.role.value, "content": m.content}
         for m in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
 
-    knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
+    # 3. 意图识别（先于 RAG，用真实 intent 替代硬编码门控）
+    intent_result = await _orchestrator.recognize_intent(req.message, history)
+
+    # 持久化意图识别结果，用于后续模型训练
+    _append_intent_log(
+        message=req.message,
+        intent=intent_result.intent.value,
+        sentiment=intent_result.sentiment.value,
+        confidence=intent_result.confidence,
+        user_id=req.user_id,
+    )
+
+    # 4. 只有明确不需要知识库的意图才跳过（GREETING/CHITCHAT/联系方式类）
+    _SKIP_RAG = {IntentCategory.GREETING, IntentCategory.CHITCHAT,
+                 IntentCategory.CONTACT_GIVE, IntentCategory.CONTACT_FIX}
+    knowledge_text, knowledge_used = "", False
+    if intent_result.intent not in _SKIP_RAG:
+        knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
+
+    # 5. 构建上下文：记忆 + 知识库
     context_parts = [mem_ctx.to_prompt_text()]
     if knowledge_text:
         context_parts.append(knowledge_text)
     full_context = "\n\n".join(part for part in context_parts if part)
 
+    # 6. 构建编排请求（预填意图，orchestrator 会跳过二次识别）
     orch_req = OrcReq(
         message=req.message,
         user_id=req.user_id,
         conv_id=conv_id,
         context=full_context,
         history=history,
+        intent=intent_result.intent,
+        sentiment=intent_result.sentiment,
+        urgency=intent_result.urgency,
     )
 
-    # 3. 执行
+    # 7. 执行
     result = await _orchestrator.run(orch_req)
 
-    # 4. 写入记忆
+    # 8. 如果用户给出了联系方式，自动存储线索
+    if result.intent and result.intent.value == "contact_give":
+        import re as _re
+        phones = _re.findall(r"1[3-9]\d{9}", req.message)
+        wechat_match = _re.search(r"微信[号:\s]*([a-zA-Z]\w+)", req.message)
+        phone = phones[0] if phones else ""
+        wechat = wechat_match.group(1) if wechat_match else ""
+        if phone or wechat:
+            _orchestrator.store_lead(req.user_id, phone=phone, wechat=wechat)
+
+    # 9. 写入记忆
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
     await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-    # 5. 异步更新用户画像（不阻塞响应）
+    # 10. 异步更新用户画像（含 sentiment 历史）
     asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
 
     return ChatResponse(
         conv_id=conv_id,
         response=result.response,
-        intent=result.intent.value if result.intent else "other",
+        intent=result.intent.value if result.intent else "chitchat",
+        sentiment=result.sentiment.value if result.sentiment else "neutral",
         agent_type=result.agent_type.value,
         escalated=result.escalated,
+        ask_contact=result.ask_contact,
         latency_ms=round(result.latency_ms, 1),
         knowledge_used=knowledge_used,
     )
@@ -278,11 +319,10 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
     """
     为 /chat 主链路构建 RAG 知识上下文。
 
-    这里复用 MCPToolManager 的查询改写、并行召回、重排、fallback 能力。
+    调用方（/chat）已根据意图做了门控，本函数不再重复判断。
+    复用 MCPToolManager 的查询改写、并行召回、重排、fallback 能力。
     """
     if _tool_manager is None:
-        return "", False
-    if not _should_use_knowledge(message):
         return "", False
     try:
         result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
@@ -311,20 +351,24 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
         return "", False
 
 
-def _should_use_knowledge(message: str) -> bool:
-    """跳过纯寒暄，业务类问题才检索知识库，避免无关 RAG 干扰回复。"""
-    msg = (message or "").strip().lower()
-    if not msg:
-        return False
-    greetings = {"你好", "您好", "嗨", "hi", "hello", "hey", "早上好", "晚上好"}
-    if msg in greetings:
-        return False
-    business_keywords = [
-        "退款", "订单", "物流", "配送", "发票", "扣款", "支付", "账单", "订阅",
-        "登录", "报错", "错误", "崩溃", "会员", "积分", "账户", "密码", "地址",
-        "refund", "order", "invoice", "payment", "error", "login",
-    ]
-    return len(msg) >= 4 or any(kw in msg for kw in business_keywords)
+def _append_intent_log(message: str, intent: str, sentiment: str,
+                       confidence: float, user_id: str) -> None:
+    """持久化 intent 识别结果（JSONL），用于后续模型训练。"""
+    log_path = pathlib.Path(_ROOT) / "data" / "intent_logs.jsonl"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "message":    message,
+            "intent":     intent,
+            "sentiment":  sentiment,
+            "confidence": round(confidence, 4),
+            "user_id":    user_id,
+            "timestamp":  _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as ex:
+        logger.warning(f"写入 intent 日志失败: {ex}")
 
 
 @app.get("/monitor")
