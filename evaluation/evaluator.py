@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 class IntentTestCase:
     message:          str
     expected_intent:  str
+    persona:          str = ""                       # 用户画像，用于注入评测上下文
     context:          Optional[Dict[str, Any]] = None
 
 
@@ -166,12 +167,18 @@ class IntentEvaluator:
         case_details: List[Dict[str, Any]] = []
 
         for case in cases:
-            result = await self._recognizer.recognize(case.message)
+            # 注入 persona 作为上下文，让 LLM 能感知用户画像做更真实的判断
+            history = None
+            if case.persona:
+                history = [{"role": "user", "content": f"用户画像：{case.persona}"}]
+
+            result = await self._recognizer.recognize(case.message, history=history)
             predicted = result.intent.value
             predictions.append(predicted)
             ground_truth.append(case.expected_intent)
             case_details.append({
                 "message": case.message,
+                "persona": case.persona,
                 "expected": case.expected_intent,
                 "predicted": predicted,
                 "confidence": result.confidence,
@@ -476,19 +483,60 @@ class EndToEndEvaluator:
 
 # ── 内置测试用例（开箱即用）──────────────────────────────────────────────────
 
-DEFAULT_INTENT_CASES: List[IntentTestCase] = [
-    IntentTestCase("你好",                        "greeting"),
-    IntentTestCase("你们产品有什么功能？",          "product_inq"),
-    IntentTestCase("多少钱一个月？",               "price_inq"),
-    IntentTestCase("我目前手上的预算是5000",        "price_inq"),
-    IntentTestCase("我要买，怎么下单？",            "purchase"),
-    IntentTestCase("你们服务太差了！",              "complaint"),
-    IntentTestCase("滚滚滚",                       "complaint"),
-    IntentTestCase("13712345678",                  "contact_give"),
-    IntentTestCase("不方便留电话",                  "contact_no"),
-    IntentTestCase("不好意思号码发错了",            "contact_fix"),
-    IntentTestCase("你是机器人吗？",                "chitchat"),
-]
+def _load_golden_intent_set() -> List[IntentTestCase]:
+    """
+    加载 Golden Intent Test Set（363 条人工标注用例）。
+
+    文件位置: tests/golden_intent_set.jsonl
+    格式:     {"persona": "...", "query": "...", "expected_intent": "..."}
+    """
+    path = pathlib.Path(__file__).parent.parent / "tests" / "golden_intent_set.jsonl"
+    if not path.exists():
+        logger.warning(f"Golden Intent Test Set 不存在: {path}，回退到默认用例")
+        return _fallback_intent_cases()
+
+    cases: List[IntentTestCase] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+                cases.append(IntentTestCase(
+                    message=d["query"],
+                    expected_intent=d["expected_intent"],
+                    persona=d.get("persona", ""),
+                ))
+            except (json.JSONDecodeError, KeyError) as ex:
+                logger.warning(f"跳过异常条目: {ex}")
+
+    if not cases:
+        logger.warning("Golden Intent Test Set 为空，回退到默认用例")
+        return _fallback_intent_cases()
+
+    logger.info(f"加载 Golden Intent Test Set: {len(cases)} 条用例")
+    return cases
+
+
+def _fallback_intent_cases() -> List[IntentTestCase]:
+    """兜底：11 条基础用例，防止文件丢失时评测瘫痪。"""
+    return [
+        IntentTestCase("你好",                        "greeting"),
+        IntentTestCase("你们产品有什么功能？",          "product_inq"),
+        IntentTestCase("多少钱一个月？",               "price_inq"),
+        IntentTestCase("我目前手上的预算是5000",        "price_inq"),
+        IntentTestCase("我要买，怎么下单？",            "purchase"),
+        IntentTestCase("你们服务太差了！",              "complaint"),
+        IntentTestCase("滚滚滚",                       "complaint"),
+        IntentTestCase("13712345678",                  "contact_give"),
+        IntentTestCase("不方便留电话",                  "contact_no"),
+        IntentTestCase("不好意思号码发错了",            "contact_fix"),
+        IntentTestCase("你是机器人吗？",                "chitchat"),
+    ]
+
+
+DEFAULT_INTENT_CASES: List[IntentTestCase] = _load_golden_intent_set()
 
 DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [
     {"question": "我的订单 #12345 还没到，已经超时了"},

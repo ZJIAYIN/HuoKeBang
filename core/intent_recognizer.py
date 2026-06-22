@@ -234,18 +234,24 @@ class IntentRecognizer:
 
         t0 = time.monotonic()
 
-        # LLM 和 Embedding 并行
-        llm_task = asyncio.create_task(self._llm_recognize(message, history))
-        emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
-        pat      = self._pattern_recognize(message)
+        # 仅使用 LLM 识别（Embedding + Pattern 路径已注释，简化链路为后续本地模型替代做准备）
+        llm = await self._llm_recognize(message, history)
 
-        if emb_task:
-            llm, emb = await asyncio.gather(llm_task, emb_task)
-        else:
-            llm = await llm_task
-            emb = {"intent": IntentCategory.CHITCHAT, "confidence": 0.0}
+        # # ── 三路融合（已注释）──────────────────────────────────────────
+        # # LLM 和 Embedding 并行
+        # llm_task = asyncio.create_task(self._llm_recognize(message, history))
+        # emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
+        # pat      = self._pattern_recognize(message)
+        #
+        # if emb_task:
+        #     llm, emb = await asyncio.gather(llm_task, emb_task)
+        # else:
+        #     llm = await llm_task
+        #     emb = {"intent": IntentCategory.CHITCHAT, "confidence": 0.0}
+        #
+        # intent    = self._vote(llm, emb, pat)
 
-        intent    = self._vote(llm, emb, pat)
+        intent    = llm.get("intent", IntentCategory.CHITCHAT)
         sentiment = self._vote_sentiment(llm, message)
         entities  = await self._extract_entities(message, intent)
         urgency   = self._urgency(message, intent, sentiment)
@@ -261,10 +267,10 @@ class IntentRecognizer:
         )
 
         # LRU 缓存
-        if len(self._cache) >= 1000:
-            for k in list(self._cache)[:500]:
-                del self._cache[k]
-        self._cache[key] = result
+        # if len(self._cache) >= 1000:
+        #     for k in list(self._cache)[:500]:
+        #         del self._cache[k]
+        # self._cache[key] = result
         return result
 
     def learn(self, message: str, correct_intent: IntentCategory,
@@ -398,32 +404,32 @@ class IntentRecognizer:
         best = max(scores, key=scores.get)  # type: ignore[arg-type]
         return {"intent": best, "confidence": scores[best]}
 
-    # ── 意图投票 ──────────────────────────────────────────────────────────────
+    # ── 意图投票（已注释 — 当前仅使用 LLM 单路，三路融合暂不使用）──────────
 
-    def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> IntentCategory:
-        """加权投票合成 intent。sentiment 不走投票流程。"""
-        if llm.get("failed"):
-            if emb.get("intent", IntentCategory.CHITCHAT) != IntentCategory.CHITCHAT and \
-               emb.get("confidence", 0.0) > 0:
-                return emb["intent"]
-            if pat.get("intent", IntentCategory.CHITCHAT) != IntentCategory.CHITCHAT and \
-               pat.get("confidence", 0.0) > 0:
-                return pat["intent"]
-            return IntentCategory.CHITCHAT
-
-        if self._embedding_enabled:
-            weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]
-        else:
-            weights = [(llm, 0.85), (pat, 0.15)]
-        scores: Dict[IntentCategory, float] = {}
-
-        for result, w in weights:
-            cat  = result.get("intent", IntentCategory.CHITCHAT)
-            conf = result.get("confidence", 0.0)
-            scores[cat] = scores.get(cat, 0.0) + w * conf
-
-        best = max(scores, key=scores.get)  # type: ignore[arg-type]
-        return best if scores[best] >= self.threshold else IntentCategory.CHITCHAT
+    # def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> IntentCategory:
+    #     """加权投票合成 intent。sentiment 不走投票流程。"""
+    #     if llm.get("failed"):
+    #         if emb.get("intent", IntentCategory.CHITCHAT) != IntentCategory.CHITCHAT and \
+    #            emb.get("confidence", 0.0) > 0:
+    #             return emb["intent"]
+    #         if pat.get("intent", IntentCategory.CHITCHAT) != IntentCategory.CHITCHAT and \
+    #            pat.get("confidence", 0.0) > 0:
+    #             return pat["intent"]
+    #         return IntentCategory.CHITCHAT
+    #
+    #     if self._embedding_enabled:
+    #         weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]
+    #     else:
+    #         weights = [(llm, 0.85), (pat, 0.15)]
+    #     scores: Dict[IntentCategory, float] = {}
+    #
+    #     for result, w in weights:
+    #         cat  = result.get("intent", IntentCategory.CHITCHAT)
+    #         conf = result.get("confidence", 0.0)
+    #         scores[cat] = scores.get(cat, 0.0) + w * conf
+    #
+    #     best = max(scores, key=scores.get)  # type: ignore[arg-type]
+    #     return best if scores[best] >= self.threshold else IntentCategory.CHITCHAT
 
     def _vote_sentiment(self, llm: Dict, message: str) -> Sentiment:
         """

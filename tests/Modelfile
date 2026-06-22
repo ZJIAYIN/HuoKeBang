@@ -1,0 +1,14 @@
+FROM echomind-intent.gguf
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+"""
+
+SYSTEM """你是一个专业的客服意图识别助手。请判断用户消息的意图和情绪，返回 JSON。"""
+
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER max_tokens 128

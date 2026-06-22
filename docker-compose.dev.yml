@@ -1,0 +1,21 @@
+# EchoMind 本地开发覆盖配置
+# 使用方式：
+#   启动基础设施（无 echomind 容器）：docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#   一键部署（忽略此文件）：       docker compose up -d
+#
+# 原理：给 echomind 加上 profile "skip-in-dev"，带 profile 的服务只在明确指定 --profile 时启动，
+#       因此 docker compose up 会跳过 echomind。其依赖方 nginx 也会自动跳过。
+
+services:
+
+  # ── 主应用：本地开发时不在容器中运行 ─────────────────────────────────────────────
+  echomind:
+    # 加上 profile 后，docker compose up 默认不启动此服务
+    profiles: ["skip-in-dev"]
+    # 本地开发用 PyCharm 直接 Debug 启动，见说明文档
+
+  # ── Nginx：本地开发时也不需要容器中的 nginx ───────────────────────────────────
+  #  本地直接访问 http://localhost:8000 即可，nginx 仅用于生产反向代理。
+  #  去掉 depends_on 里的 echomind 依赖，否则 docker compose 报错
+  nginx:
+    profiles: ["skip-in-dev"]

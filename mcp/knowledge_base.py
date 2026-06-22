@@ -285,30 +285,41 @@ class KnowledgeBase:
 
     def add_documents(self, documents: List[Dict[str, str]]) -> Dict[str, Any]:
         """
-        批量导入文档到知识库。
+        批量导入文档到知识库（带内容去重）。
 
         documents 格式: [{"title": "...", "content": "..."}, ...]
 
-        每篇文档自动生成 doc_id（title + content 前 200 字哈希），
-        存入每个 chunk 的 metadata，方便后续按文档粒度删除。
+        每篇文档以全文 MD5 作为 doc_id，重复上传自动跳过。
+        doc_id 存入每个 chunk 的 metadata，支持按文档粒度删除。
 
-        返回: {"added_chunks": N, "doc_ids": [...]}
+        返回: {"added_chunks": N, "doc_ids": [...], "skipped": N}
 
         流程：
-          1. 递归切割 + 贪心凑块（~500 字）+ overlap 50
-          2. 存入 ChromaDB（向量索引），附 doc_id 元数据
-          3. 同步加入 BM25 关键词索引
+          1. 全文 MD5 计算 doc_id，检查是否已存在
+          2. 新文档：递归切割 + 贪心凑块（~500 字）+ overlap 50
+          3. 存入 ChromaDB（向量索引），同步加入 BM25 关键词索引
         """
         ids, docs, metas = [], [], []
         doc_ids: List[str] = []
+        skipped = 0
 
         for doc in documents:
             title   = doc.get("title", "")
             content = doc.get("content", "")
-            # 生成文档级 ID：同内容重传幂等
-            doc_id  = hashlib.md5(f"{title}_{content[:200]}".encode()).hexdigest()[:16]
+            # 全文 MD5 作为文档 ID，内容一致即可幂等
+            doc_id  = hashlib.md5(content.encode("utf-8")).hexdigest()
             doc_ids.append(doc_id)
-            chunks  = self._chunk(content)
+
+            # 去重：检查 doc_id 是否已存在
+            try:
+                existing = self._collection.get(where={"doc_id": doc_id})
+                if existing["ids"]:
+                    skipped += 1
+                    continue
+            except Exception:
+                pass  # 查重失败时继续导入，避免因查询异常阻塞写入
+
+            chunks = self._chunk(content)
 
             for i, chunk_text in enumerate(chunks):
                 chunk_id = hashlib.md5(
@@ -329,7 +340,7 @@ class KnowledgeBase:
             if not (len(ids) == len(docs) == len(metas)):
                 logger.error(
                     f"列表长度不一致！ids={len(ids)} docs={len(docs)} metas={len(metas)}"
-                    f" 共 {len(documents)} 篇文档"
+                    f" 共 {len(documents)} 篇文档，已跳过 {skipped} 篇重复"
                 )
                 for d in documents:
                     logger.error(f"  doc title={d.get('title','')[:50]} content_len={len(d.get('content',''))}")
@@ -340,10 +351,14 @@ class KnowledgeBase:
             self._collection.add(ids=ids, documents=docs, metadatas=metas)
             logger.info(
                 f"知识库导入 {len(ids)} 个片段（{len(doc_ids)} 篇文档），"
+                f"已跳过 {skipped} 篇重复，"
                 f"BM25 索引 {self._bm25.doc_count} 篇"
             )
 
-        return {"added_chunks": len(ids), "doc_ids": doc_ids}
+        if skipped and not ids:
+            logger.info(f"全部 {skipped} 篇文档均为重复，已跳过")
+
+        return {"added_chunks": len(ids), "doc_ids": doc_ids, "skipped": skipped}
 
     def delete_by_doc_id(self, doc_id: str) -> int:
         """

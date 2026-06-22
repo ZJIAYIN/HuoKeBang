@@ -1,5 +1,5 @@
 # EchoMind 智能客服系统 — Docker Compose 服务编排
-# 三级记忆架构：Redis（工作记忆）+ ChromaDB（情景记忆 + 用户画像）
+# 三级记忆架构：Redis（工作记忆）+ Milvus（知识库 + 情景记忆 + 用户画像）
 
 services:
 
@@ -21,27 +21,95 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── ChromaDB 向量数据库（情景记忆 + 用户画像）────────────────────────────────
-  chromadb:
-    image: chromadb/chroma:0.5.23
-    container_name: echomind-chromadb
-    ports:
-      - "8001:8000"
+  # ── etcd（Milvus 元数据存储）──────────────────────────────────────────────────
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    container_name: echomind-etcd
     environment:
-      - IS_PERSISTENT=TRUE
-      - PERSIST_DIRECTORY=/chroma/chroma
-      - ANONYMIZED_TELEMETRY=FALSE
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - chromadb-data:/chroma/chroma
+      - etcd-data:/etcd
+    command: >
+      etcd --advertise-client-urls http://0.0.0.0:2379
+           --listen-client-urls http://0.0.0.0:2379
+           --data-dir /etcd
     restart: unless-stopped
     networks:
       - echomind-network
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/heartbeat || exit 1"]
+      test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  # ── MinIO（Milvus 向量数据持久化）─────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: echomind-minio
+    ports:
+      - "9000:9000"      # 对象存储 API
+      - "9001:9001"      # Web 控制台
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    restart: unless-stopped
+    networks:
+      - echomind-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ── Milvus 向量数据库 ─────────────────────────────────────────────────────────
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: echomind-milvus
+    ports:
+      - "19530:19530"    # gRPC
+      - "9091:9091"      # HTTP 指标
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - echomind-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Attu（Milvus Web 管理界面）────────────────────────────────────────────────
+  attu:
+    image: zilliz/attu:latest
+    container_name: echomind-attu
+    ports:
+      - "8085:3000"
+    environment:
+      MILVUS_URL: milvus:19530
+    depends_on:
+      milvus:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - echomind-network
 
   # ── Prometheus 监控 ─────────────────────────────────────────────────────────
   prometheus:
@@ -81,16 +149,17 @@ services:
     environment:
       # 容器内固定值，覆盖 .env 中的本地路径
       - REDIS_URL=redis://:${REDIS_PASSWORD:-echomind123}@redis:6379/0
-      - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
     volumes:
-      - ./data/chroma:/app/data/chroma
+      - ./data/models:/app/data/models
       - ./data/eval:/app/data/eval
       - ./logs:/app/logs
     depends_on:
       redis:
         condition: service_healthy
-      chromadb:
+      milvus:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -100,14 +169,14 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 90s
+      start_period: 120s
 
   # ── Nginx 反向代理 ──────────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
     container_name: echomind-nginx
     ports:
-      - "80:80"
+      - "8084:80"
     volumes:
       - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx-logs:/var/log/nginx
@@ -135,6 +204,8 @@ networks:
 # ── 数据卷 ──────────────────────────────────────────────────────────────────
 volumes:
   redis-data:
-  chromadb-data:
+  etcd-data:
+  minio-data:
+  milvus-data:
   prometheus-data:
   nginx-logs:

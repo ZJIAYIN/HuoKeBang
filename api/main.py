@@ -255,11 +255,13 @@ async def chat(req: ChatRequest):
         sentiment=intent_result.sentiment.value,
         confidence=intent_result.confidence,
         user_id=req.user_id,
+        history=history,
+        reasoning=intent_result.reasoning,
     )
 
     # 4. 只有明确不需要知识库的意图才跳过（GREETING/CHITCHAT/联系方式类）
-    _SKIP_RAG = {IntentCategory.GREETING, IntentCategory.CHITCHAT,
-                 IntentCategory.CONTACT_GIVE, IntentCategory.CONTACT_FIX}
+
+
     knowledge_text, knowledge_used = "", False
     if intent_result.intent not in _SKIP_RAG:
         knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
@@ -352,7 +354,9 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
 
 
 def _append_intent_log(message: str, intent: str, sentiment: str,
-                       confidence: float, user_id: str) -> None:
+                       confidence: float, user_id: str,
+                       history: Optional[List[Dict[str, str]]] = None,
+                       reasoning: str = "") -> None:
     """持久化 intent 识别结果（JSONL），用于后续模型训练。"""
     log_path = pathlib.Path(_ROOT) / "data" / "intent_logs.jsonl"
     try:
@@ -363,6 +367,8 @@ def _append_intent_log(message: str, intent: str, sentiment: str,
             "sentiment":  sentiment,
             "confidence": round(confidence, 4),
             "user_id":    user_id,
+            "history":    history or [],
+            "reasoning":  reasoning,
             "timestamp":  _time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         with open(log_path, "a", encoding="utf-8") as f:
@@ -412,6 +418,7 @@ class EvalIntentInput(BaseModel):
     """意图识别评测用例。"""
     message: str
     expected_intent: str
+    persona: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
 
 
@@ -452,9 +459,13 @@ async def add_knowledge(body: BatchDocInput):
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
     result = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
+    message = f"成功导入 {result['added_chunks']} 个文档片段"
+    if result.get("skipped"):
+        message += f"，跳过 {result['skipped']} 篇重复"
     return {
-        "message": f"成功导入 {result['added_chunks']} 个文档片段",
+        "message": message,
         "added_chunks": result["added_chunks"],
+        "skipped": result.get("skipped", 0),
         "doc_ids": result["doc_ids"],
         "total_chunks": kb.doc_count,
     }
@@ -498,9 +509,13 @@ async def upload_knowledge(file: UploadFile = File(...)):
         docs = [{"title": title, "content": text}]
 
     result = kb.add_documents(docs)
+    message = f"文件 {filename} 导入成功，新增 {result['added_chunks']} 个片段"
+    if result.get("skipped"):
+        message += f"，跳过 {result['skipped']} 篇重复"
     return {
-        "message": f"文件 {filename} 导入成功",
+        "message": message,
         "added_chunks": result["added_chunks"],
+        "skipped": result.get("skipped", 0),
         "doc_ids": result["doc_ids"],
         "total_chunks": kb.doc_count,
         "source_docs": len(docs),
@@ -728,6 +743,7 @@ async def run_eval(body: Optional[EvalRunInput] = None):
             IntentTestCase(
                 message=c.message,
                 expected_intent=c.expected_intent,
+                persona=c.persona or "",
                 context=c.context,
             )
             for c in body.intent_cases
