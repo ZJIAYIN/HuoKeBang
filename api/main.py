@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -47,6 +47,7 @@ BANNER = r"""
 _engine     = None  # AgentEngine（新架构）
 _memory     = None
 _kb         = None
+_detector   = None  # Prompt Injection 检测器
 
 
 API_KEY = "sk-92f09f3ada494ecd8390763ff293906b"
@@ -57,7 +58,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine, _memory, _kb
+    global _engine, _memory, _kb, _detector
 
     print(BANNER, flush=True)
 
@@ -93,6 +94,10 @@ async def lifespan(app: FastAPI):
         model=MODEL,
     )
 
+    # ── 注入检测器（基于向量相似度的 Prompt Injection 检测） ──────────────
+    from security.injection_detector import InjectionDetector
+    _detector = InjectionDetector(model_name=EMBEDDING_MODEL, threshold=0.85)
+
     logger.info("EchoMind v2（新架构）已就绪")
     yield
 
@@ -117,7 +122,7 @@ app.add_middleware(
 
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    message:     str
+    message:     str = Field(..., max_length=4000, description="用户消息，最长 4000 字符")
     user_id:     str = "anonymous"
     conv_id:     Optional[str] = None
 
@@ -155,6 +160,19 @@ async def chat(req: ChatRequest):
     if _engine is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
+    # ── 0. Prompt Injection 检测（优先拦截，不进入后续流程） ────────────
+    if _detector and _detector.check(req.message):
+        return ChatResponse(
+            conv_id=req.conv_id or str(uuid.uuid4()),
+            response="抱歉，您的输入包含异常内容，请重新描述您的问题。",
+            primary_intent="chitchat",
+            sub_tasks=["GREETING"],
+            emotion="neutral",
+            skill_statuses=[],
+            knowledge_used=False,
+            latency_ms=0.0,
+        )
+
     from memory.conversation_memory import MsgRole
 
     conv_id = req.conv_id or str(uuid.uuid4())
@@ -170,7 +188,7 @@ async def chat(req: ChatRequest):
 
     # 3. AgentEngine 完整链路（理解 → 编排 → 生成）
     result = await _engine.run(
-        message=req.message,
+        message=req.message.strip(),
         conv_id=conv_id,
         user_id=req.user_id,
         memory_context=mem_ctx.to_prompt_text(),
