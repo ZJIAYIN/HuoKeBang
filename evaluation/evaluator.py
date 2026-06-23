@@ -233,15 +233,12 @@ class EndToEndEvaluator:
         self,
         orchestrator,
         recognizer: IntentRecognizer,
-        api_key:  str,
-        base_url: Optional[str] = None,
-        model:    str = "claude-3-5-sonnet-20241022",
+        api_key:  str = "sk-92f09f3ada494ecd8390763ff293906b",
+        base_url: Optional[str] = "https://api.deepseek.com/anthropic",
+        model:    str = "deepseek-chat",
         baseline_path: Optional[str] = None,
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        client = AsyncAnthropic(api_key=api_key, base_url=base_url)
 
         self._orchestrator     = orchestrator
         self._judge            = LLMJudge(client, model)

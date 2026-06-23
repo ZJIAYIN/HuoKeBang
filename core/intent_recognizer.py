@@ -1,13 +1,23 @@
 """
-亮点：端到端二维意图识别（Intent + Sentiment）
+Planner — 理解层（LLM）
 
-三路融合策略：
-  1. LLM 语义理解（权重 70%）—— 主力，一次输出 intent + sentiment
-  2. Embedding 向量相似度（权重 20%）—— 快速匹配常见表达
-  3. 关键词模式匹配（权重 10%）—— 零延迟兜底，手机号正则等
+职责：
+  将用户自然语言输入转化为结构化信息，供编排层处理。
+  Planner 是"理解层"，只做理解，不做判断和生成。
 
-三路结果通过加权投票合并 intent，sentiment 以 LLM 为准、Pattern 辅助。
-LLM 和 Embedding 并行调用，不串行等待。
+输出：
+  - primary_intent: 主意图（全量）
+  - sub_tasks: 子任务列表（全量，每轮完整输出）
+  - slot_ops: 槽位变更（增量 Diff，SET / DELETE）
+  - emotion: 用户情绪
+
+设计原则：
+  - LLM 负责理解（它擅长的）
+  - 状态管理交给程序（Slot Manager / Orchestrator）
+  - 输出增量 Diff 而非全量状态 —— 避免 LLM 漏字段的歧义
+
+向后兼容：
+  IntentRecognizer 保留为 Planner 的别名，供 evaluator / api 使用。
 """
 import asyncio
 import hashlib
@@ -15,7 +25,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -24,26 +34,30 @@ from anthropic import AsyncAnthropic
 logger = logging.getLogger(__name__)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 枚举
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class IntentCategory(Enum):
-    """留资型客服意图"""
-    GREETING      = "greeting"       # 打招呼/开场
-    PRODUCT_INQ   = "product_inq"    # 咨询产品/服务
-    PRICE_INQ     = "price_inq"      # 询问价格/预算
-    PURCHASE      = "purchase"       # 购买意向明确
-    COMPLAINT     = "complaint"      # 投诉/不满
-    CONTACT_GIVE  = "contact_give"   # 给出联系方式
-    CONTACT_NO    = "contact_no"     # 拒绝留联系方式
-    CONTACT_FIX   = "contact_fix"    # 更正联系方式
-    CHITCHAT      = "chitchat"       # 闲聊/无关
+    """留资型客服意图（保持向后兼容）"""
+    GREETING      = "greeting"
+    PRODUCT_INQ   = "product_inq"
+    PRICE_INQ     = "price_inq"
+    PURCHASE      = "purchase"
+    COMPLAINT     = "complaint"
+    CONTACT_GIVE  = "contact_give"
+    CONTACT_NO    = "contact_no"
+    CONTACT_FIX   = "contact_fix"
+    CHITCHAT      = "chitchat"
 
 
 class Sentiment(Enum):
-    """用户情绪/态度"""
-    POSITIVE  = "positive"   # 积极/信任
-    NEUTRAL   = "neutral"    # 中性
-    SKEPTICAL = "skeptical"  # 质疑/犹豫
-    ANXIOUS   = "anxious"    # 焦虑/顾虑
-    NEGATIVE  = "negative"   # 愤怒/驱离
+    """用户情绪（保持向后兼容）"""
+    POSITIVE  = "positive"
+    NEUTRAL   = "neutral"
+    SKEPTICAL = "skeptical"
+    ANXIOUS   = "anxious"
+    NEGATIVE  = "negative"
 
 
 class UrgencyLevel(Enum):
@@ -53,8 +67,52 @@ class UrgencyLevel(Enum):
     CRITICAL = 4
 
 
+class SlotOpType(Enum):
+    """槽位操作类型"""
+    SET    = "SET"
+    DELETE = "DELETE"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 数据结构
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SlotOp:
+    """单条槽位操作"""
+    op:    SlotOpType
+    slot:  str
+    value: Any = None
+
+
+@dataclass
+class PlannerOutput:
+    """Planner 输出 — 新架构的核心数据结构"""
+
+    primary_intent: str               # 主意图（取值同 IntentCategory）
+    sub_tasks: List[str]              # 子任务列表（对应 Skill.name）
+    slot_ops: List[SlotOp]            # 槽位变更（增量 Diff）
+    emotion: str                      # 用户情绪（取值同 Sentiment）
+    confidence: float = 1.0           # 整体置信度
+    reasoning: str = ""               # 推理说明
+    latency_ms: float = 0.0           # 耗时
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "primary_intent": self.primary_intent,
+            "sub_tasks": self.sub_tasks,
+            "slot_ops": [{"op": o.op.value, "slot": o.slot, "value": o.value} for o in self.slot_ops],
+            "emotion": self.emotion,
+            "confidence": self.confidence,
+            "reasoning": self.reasoning,
+        }
+
+
+# ── 向后兼容：保持旧的 IntentResult ──────────────────────────────────────────
+
 @dataclass
 class IntentResult:
+    """旧版意图识别结果（向后兼容，供 evaluator 使用）"""
     intent:      IntentCategory
     sentiment:   Sentiment
     confidence:  float
@@ -65,499 +123,314 @@ class IntentResult:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）
-# 每条模板标注 intent + sentiment 双标签，LLM 靠这些示例理解边界
+# Few-shot 模板（供 Planner 的 LLM prompt 使用）
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── (intent, sentiment, 示例消息) ──────────────────────────────────────────────
 _FEWSHOT = [
-    # GREETING
-    (IntentCategory.GREETING,     Sentiment.POSITIVE,  "你好"),
-    (IntentCategory.GREETING,     Sentiment.NEUTRAL,   "在吗？"),
-    (IntentCategory.GREETING,     Sentiment.POSITIVE,  "早上好"),
-    # PRODUCT_INQ
-    (IntentCategory.PRODUCT_INQ,  Sentiment.NEUTRAL,   "你们产品有什么功能？"),
-    (IntentCategory.PRODUCT_INQ,  Sentiment.NEUTRAL,   "这个和XX比怎么样？"),
-    (IntentCategory.PRODUCT_INQ,  Sentiment.SKEPTICAL, "你确定这个有用吗？"),
-    (IntentCategory.PRODUCT_INQ,  Sentiment.ANXIOUS,   "会不会用几天就坏了？"),
-    # PRICE_INQ
-    (IntentCategory.PRICE_INQ,    Sentiment.NEUTRAL,   "多少钱一个月？"),
-    (IntentCategory.PRICE_INQ,    Sentiment.NEUTRAL,   "我目前手上的预算是5000"),
-    (IntentCategory.PRICE_INQ,    Sentiment.SKEPTICAL, "太贵了吧，能不能便宜点？"),
-    (IntentCategory.PRICE_INQ,    Sentiment.ANXIOUS,   "带不了款，还有别的办法吗？"),
-    # PURCHASE
-    (IntentCategory.PURCHASE,     Sentiment.POSITIVE,  "我要买，怎么下单？"),
-    (IntentCategory.PURCHASE,     Sentiment.POSITIVE,  "给我来一个试试"),
-    (IntentCategory.PURCHASE,     Sentiment.NEUTRAL,   "怎么付款？"),
-    (IntentCategory.PURCHASE,     Sentiment.SKEPTICAL, "算了算了，不买了"),
-    # COMPLAINT
-    (IntentCategory.COMPLAINT,    Sentiment.NEGATIVE,  "滚滚滚，别烦我"),
-    (IntentCategory.COMPLAINT,    Sentiment.SKEPTICAL, "说的好听，骗人的吧"),
-    (IntentCategory.COMPLAINT,    Sentiment.NEGATIVE,  "等了这么久没人理我"),
-    # CONTACT_GIVE
-    (IntentCategory.CONTACT_GIVE, Sentiment.NEUTRAL,   "13712345678"),
-    (IntentCategory.CONTACT_GIVE, Sentiment.POSITIVE,  "我的微信号是abc123"),
-    (IntentCategory.CONTACT_GIVE, Sentiment.POSITIVE,  "手机号138xxxx，微信同号"),
-    (IntentCategory.CONTACT_GIVE, Sentiment.NEUTRAL,   "你记一下，13900001111"),
-    # CONTACT_NO
-    (IntentCategory.CONTACT_NO,   Sentiment.NEUTRAL,   "不方便留电话"),
-    (IntentCategory.CONTACT_NO,   Sentiment.ANXIOUS,   "还是算了吧，不放心"),
-    (IntentCategory.CONTACT_NO,   Sentiment.NEGATIVE,  "说了不留就是不留"),
-    # CONTACT_FIX
-    (IntentCategory.CONTACT_FIX,  Sentiment.NEUTRAL,   "不好意思，号码发错了，是139"),
-    (IntentCategory.CONTACT_FIX,  Sentiment.NEUTRAL,   "微信不是这个，换一个"),
-    # CHITCHAT
-    (IntentCategory.CHITCHAT,     Sentiment.POSITIVE,  "今天天气不错"),
-    (IntentCategory.CHITCHAT,     Sentiment.NEUTRAL,   "你是机器人吗？"),
+    # (intent, sub_tasks_str, emotion, 示例消息, slot_ops)
+    (IntentCategory.GREETING,    ["GREETING"],              "positive",  "你好",       []),
+    (IntentCategory.GREETING,    ["GREETING"],              "neutral",   "在吗？",     []),
+    (IntentCategory.PRODUCT_INQ, ["PRODUCT"],               "neutral",   "M8有什么配置？", [{"op":"SET","slot":"model","value":"M8"}]),
+    (IntentCategory.PRODUCT_INQ, ["PRODUCT", "PRICE"],      "skeptical", "M8怎么样，贵不贵？", [{"op":"SET","slot":"model","value":"M8"}]),
+    (IntentCategory.PRICE_INQ,   ["PRICE"],                 "neutral",   "多少钱一个月？", []),
+    (IntentCategory.PRICE_INQ,   ["PRICE", "FINANCE"],      "skeptical", "预算20万，M8能分期吗？", [{"op":"SET","slot":"model","value":"M8"},{"op":"SET","slot":"budget","value":"20万"}]),
+    (IntentCategory.PURCHASE,    ["PURCHASE", "LEAD_CAPTURE"], "positive", "我要买，怎么下单？", []),
+    (IntentCategory.COMPLAINT,   ["COMPLAINT"],             "negative",  "等了这么久没人理我", [{"op":"SET","slot":"issue","value":"无人响应"}]),
+    (IntentCategory.COMPLAINT,   ["COMPLAINT", "PRICE"],    "skeptical", "你们服务太差了，M8到底多少钱？", [{"op":"SET","slot":"issue","value":"服务差"},{"op":"SET","slot":"model","value":"M8"}]),
+    (IntentCategory.CONTACT_GIVE, ["LEAD_CAPTURE"],         "neutral",   "13712345678", [{"op":"SET","slot":"phone","value":"13712345678"}]),
+    (IntentCategory.CONTACT_GIVE, ["LEAD_CAPTURE"],         "positive",  "我的微信号是abc123", [{"op":"SET","slot":"wechat","value":"abc123"}]),
+    (IntentCategory.CONTACT_NO,  ["CONTACT_NO"],            "neutral",   "不方便留电话", [{"op":"SET","slot":"lead_refused","value":True}]),
+    (IntentCategory.CHITCHAT,    ["GREETING"],              "positive",  "今天天气不错", []),
+    (IntentCategory.CHITCHAT,    ["GREETING"],              "neutral",   "你是机器人吗？", []),
 ]
 
-# 按 IntentCategory 分组（供 Embedding 匹配使用）
-_TEMPLATES: Dict[IntentCategory, List[str]] = {}
-for _cat, _sent, _msg in _FEWSHOT:
-    _TEMPLATES.setdefault(_cat, []).append(_msg)
+# 意图 → sub_tasks 映射（给 LLM 参考）
+_INTENT_TO_SUBTASKS: Dict[IntentCategory, List[str]] = {
+    IntentCategory.GREETING:      ["GREETING"],
+    IntentCategory.PRODUCT_INQ:   ["PRODUCT"],
+    IntentCategory.PRICE_INQ:     ["PRICE"],
+    IntentCategory.PURCHASE:      ["PURCHASE", "LEAD_CAPTURE"],
+    IntentCategory.COMPLAINT:     ["COMPLAINT"],
+    IntentCategory.CONTACT_GIVE:  ["LEAD_CAPTURE"],
+    IntentCategory.CONTACT_NO:    ["CONTACT_NO"],
+    IntentCategory.CONTACT_FIX:   ["CONTACT_FIX"],
+    IntentCategory.CHITCHAT:      ["GREETING"],
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Pattern 关键词/正则匹配（零延迟兜底）
+# Planner
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_PATTERNS: Dict[IntentCategory, List[str]] = {
-    IntentCategory.CONTACT_GIVE: [
-        r"1[3-9]\d{9}",             # 手机号
-        r"微信[号:\s]*[a-zA-Z]\w+",
-        r"手机[号:\s]*1\d+",
-        r"你记一下",
-    ],
-    IntentCategory.CONTACT_NO: [
-        "不方便", "不想留", "不用了", "算了吧",
-        "不留", "别问了", "不给",
-    ],
-    IntentCategory.CONTACT_FIX: [
-        "发错了", "打错了", "换一个", "不是这个",
-        "更正", "纠正",
-    ],
-    IntentCategory.COMPLAINT: [
-        "滚滚滚", "骗子", "坑人", "投诉", "举报", "垃圾",
-    ],
-    IntentCategory.GREETING: [
-        "你好", "嗨", "hello", "hi", "在吗", "早上好", "晚上好",
-    ],
-    IntentCategory.PURCHASE: [
-        "我要买", "下单", "购买", "怎么买", "给我来",
-    ],
-    IntentCategory.PRICE_INQ: [
-        "多少钱", "价格", "预算", "优惠", "折扣", "分期",
-    ],
-    IntentCategory.PRODUCT_INQ: [
-        "功能", "怎么用", "怎么样", "介绍", "说明",
-    ],
-}
-
-# 情绪关键词（Pattern 辅助，LLM 为准）
-_SENTIMENT_PATTERNS: Dict[Sentiment, List[str]] = {
-    Sentiment.NEGATIVE:  ["滚滚滚", "骗子", "别烦", "垃圾", "傻逼", "滚", "滚蛋"],
-    Sentiment.SKEPTICAL: ["真的吗", "确定吗", "靠谱吗", "骗人的吧", "假的吧", "忽悠"],
-    Sentiment.ANXIOUS:   ["怕", "担心", "万一", "带不了款", "不敢", "怕被骗"],
-    Sentiment.POSITIVE:  ["好的", "不错", "可以", "谢谢", "行", "OK", "ok"],
-}
-
-# 紧急关键词
-# 紧急关键词（已废弃，紧急度改为从 intent+sentiment 推导）
-# _URGENCY_KEYWORDS = {
-#     UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
-#     UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
-#     UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
-# }
-
-
-def _cosine(a: List[float], b: List[float]) -> float:
-    """纯 Python 余弦相似度，不依赖 numpy。"""
-    dot = sum(x * y for x, y in zip(a, b))
-    na  = sum(x * x for x in a) ** 0.5
-    nb  = sum(x * x for x in b) ** 0.5
-    return dot / (na * nb) if na and nb else 0.0
-
-
-def _match_regex(pattern: str, text: str) -> bool:
-    """检查正则 pattern 是否在 text 中命中。"""
-    try:
-        return bool(re.search(pattern, text))
-    except re.error:
-        return False
-
-
-class IntentRecognizer:
+class Planner:
     """
-    二维意图识别器（Intent + Sentiment）。
+    理解层 — 将用户输入转化为结构化信息。
 
-    初始化时不加载任何本地模型，所有 AI 能力通过 Anthropic API 调用。
-    模板 Embedding 在首次请求时懒加载并缓存，后续复用。
+    用法：
+        planner = Planner(api_key=..., model=...)
+        result = await planner.plan("我想买M8", history=[...])
+        # result.sub_tasks → ["PURCHASE", "LEAD_CAPTURE"]
+        # result.slot_ops  → [SlotOp(SET, "model", "M8")]
     """
 
     def __init__(
         self,
-        api_key: str,
-        base_url: Optional[str] = None,
-        model: str = "claude-3-5-sonnet-20241022",
-        confidence_threshold: float = 0.5,
+        api_key: str = "sk-92f09f3ada494ecd8390763ff293906b",
+        base_url: Optional[str] = "https://api.deepseek.com/anthropic",
+        model: str = "deepseek-chat",
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self.client    = AsyncAnthropic(**kwargs)
-        self.model     = model
-        self.threshold = confidence_threshold
-        self._embedding_enabled = not bool(base_url)
+        self.client = AsyncAnthropic(api_key=api_key, base_url=base_url)
+        self.model = model
+        self._cache: Dict[str, PlannerOutput] = {}
 
-        self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
-        self._cache: Dict[str, IntentResult] = {}
-        self.cache_hits   = 0
-        self.cache_misses = 0
+    # ── 主入口 ─────────────────────────────────────────────────────────────
 
-    # ── 公开接口 ──────────────────────────────────────────────────────────────
-
-    async def recognize(
+    async def plan(
         self,
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
-    ) -> IntentResult:
+        existing_slots: Optional[Dict[str, Any]] = None,
+    ) -> PlannerOutput:
         """
-        识别用户意图和情绪。
+        理解用户输入，输出结构化信息。
 
-        history 格式：[{"role": "user"/"assistant", "content": "..."}]
+        参数：
+            message:        用户当前输入
+            history:        对话历史 [{"role":"user"/"assistant", "content":"..."}]
+            existing_slots: 当前会话已有槽位（让 Planner 知道已积累的信息）
         """
-        key = self._cache_key(message)
-        if key in self._cache:
-            self.cache_hits += 1
-            return self._cache[key]
-        self.cache_misses += 1
-
         t0 = time.monotonic()
 
-        # 仅使用 LLM 识别（Embedding + Pattern 路径已注释，简化链路为后续本地模型替代做准备）
-        llm = await self._llm_recognize(message, history)
+        output = await self._llm_plan(message, history, existing_slots)
+        output.latency_ms = (time.monotonic() - t0) * 1000
+        return output
 
-        # # ── 三路融合（已注释）──────────────────────────────────────────
-        # # LLM 和 Embedding 并行
-        # llm_task = asyncio.create_task(self._llm_recognize(message, history))
-        # emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
-        # pat      = self._pattern_recognize(message)
-        #
-        # if emb_task:
-        #     llm, emb = await asyncio.gather(llm_task, emb_task)
-        # else:
-        #     llm = await llm_task
-        #     emb = {"intent": IntentCategory.CHITCHAT, "confidence": 0.0}
-        #
-        # intent    = self._vote(llm, emb, pat)
+    # ── LLM 调用 ──────────────────────────────────────────────────────────
 
-        intent    = llm.get("intent", IntentCategory.CHITCHAT)
-        sentiment = self._vote_sentiment(llm, message)
-        entities  = await self._extract_entities(message, intent)
-        urgency   = self._urgency(message, intent, sentiment)
-
-        result = IntentResult(
-            intent=intent,
-            sentiment=sentiment,
-            confidence=llm["confidence"],
-            urgency=urgency,
-            entities=entities,
-            reasoning=llm.get("reasoning", ""),
-            latency_ms=(time.monotonic() - t0) * 1000,
-        )
-
-        # LRU 缓存
-        # if len(self._cache) >= 1000:
-        #     for k in list(self._cache)[:500]:
-        #         del self._cache[k]
-        # self._cache[key] = result
-        return result
-
-    def learn(self, message: str, correct_intent: IntentCategory,
-              correct_sentiment: Sentiment = Sentiment.NEUTRAL) -> None:
-        """在线学习：将纠正样本加入模板，清除对应 Embedding 缓存。"""
-        _FEWSHOT.append((correct_intent, correct_sentiment, message))
-        tpls = _TEMPLATES.setdefault(correct_intent, [])
-        if message not in tpls:
-            tpls.append(message)
-            self._tpl_embeddings.pop(correct_intent, None)
-            logger.info(f"学习新样本 → {correct_intent.value}/{correct_sentiment.value}: {message[:40]}")
-
-    # ── 策略 1：LLM 二维识别 ─────────────────────────────────────────────────
-
-    async def _llm_recognize(
+    async def _llm_plan(
         self,
         message: str,
         history: Optional[List[Dict[str, str]]],
-    ) -> Dict[str, Any]:
-        """策略 1：LLM 一次输出 intent + sentiment（Few-shot + 上下文）。"""
+        existing_slots: Optional[Dict[str, Any]],
+    ) -> PlannerOutput:
+        """调用 LLM 进行意图理解 + 槽位提取。"""
         message = self._clean_text(message)
 
-        # 构建 Few-shot 示例（每类挑代表性条目，控制 prompt 长度）
-        seen = set()
+        # 构建 Few-shot 示例
         examples = []
-        for cat, sent, msg in _FEWSHOT:
-            if (cat.value, sent.value) not in seen:
-                seen.add((cat.value, sent.value))
-                examples.append(f'  消息: "{msg}" → 意图: {cat.value}  情绪: {sent.value}')
-            # 对关键意图多给一个示例
-            elif cat in (IntentCategory.CONTACT_GIVE, IntentCategory.COMPLAINT) and \
-                 (cat.value, sent.value, "extra") not in seen:
-                seen.add((cat.value, sent.value, "extra"))
-                examples.append(f'  消息: "{msg}" → 意图: {cat.value}  情绪: {sent.value}')
+        for cat, tasks, emo, msg, ops in _FEWSHOT:
+            ops_str = json.dumps(ops, ensure_ascii=False) if ops else "[]"
+            examples.append(f'  消息: "{msg}"\n    意图: {cat.value}  子任务: {tasks}  情绪: {emo}  槽位操作: {ops_str}')
 
-        # 最近 3 轮对话上下文
+        # 会话历史
         ctx = ""
         if history:
             ctx = "\n最近对话:\n" + "\n".join(
-                f"  {self._clean_text(m.get('role', 'user'))}: {self._clean_text(m.get('content', ''))}"
-                for m in history[-3:]
+                f"  {m.get('role', 'user')}: {self._clean_text(m.get('content', ''))}"
+                for m in history[-5:]
             )
 
-        prompt = f"""你是客服意图分析专家。请同时判断用户意图和情绪，返回 JSON。
+        # 已有槽位
+        slots_hint = ""
+        if existing_slots:
+            slots_hint = f"\n已有槽位: {json.dumps(existing_slots, ensure_ascii=False)}"
 
-示例:
+        # sub_tasks 可选值
+        all_sub_tasks = sorted(set(
+            t for tasks in _INTENT_TO_SUBTASKS.values() for t in tasks
+        ))
+
+        prompt = f"""你是客服语义理解专家。请分析用户消息，输出 JSON。
+
+返回格式：
+{{
+    "primary_intent": "主意图",
+    "sub_tasks": ["子任务1", "子任务2"],
+    "slot_ops": [
+        {{"op": "SET", "slot": "字段名", "value": "值"}},
+        {{"op": "DELETE", "slot": "字段名"}}
+    ],
+    "emotion": "情绪",
+    "confidence": 0-1,
+    "reasoning": "一句话推理"
+}}
+
+=== 示例 ===
 {chr(10).join(examples)}
 
-{ctx}
-用户消息: "{message}"
+=== 规则 ===
+- primary_intent 取值: {", ".join(c.value for c in IntentCategory)}
+- sub_tasks 从以下取值（可多个）: {", ".join(all_sub_tasks)}
+  - GREETING        基础问候/闲聊
+  - PRODUCT         产品/车型咨询
+  - PRICE           价格咨询
+  - FINANCE         金融方案
+  - COMPLAINT       投诉/不满
+  - LEAD_CAPTURE    留资/联系方式
+  - CONTACT_NO      拒绝留资
+- emotion 取值: {", ".join(s.value for s in Sentiment)}
+- slot_ops 用 SET 设置提取到的字段，DELETE 删除用户明确取消的字段
+- 常见槽位: model(车型), budget(预算), phone(手机号), wechat(微信号),
+            issue(投诉事由), product(产品名), name(姓名),
+            lead_refused(拒绝留资)
+- lead_refused 在用户明确说不留电话/不需要时 SET 为 true
+- slot 值是用户消息中明确提到的，不要猜、不要编
 
-返回格式（仅 JSON，不要其他文字）:
-{{"intent": "<意图值>", "sentiment": "<情绪值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
+=== 注意事项 ===
+- 多个意图时，primary_intent 选最核心的那个，其他放 sub_tasks
+- 用户报预算但没说要买 → sub_tasks 包含 PRICE、不一定要 PURCHASE
+- "滚滚滚"/"骗子"是 negative；"你确定吗"只是 skeptical
+- 纯数字手机号 → 提取 phone 字段
+- 用户说"算了不要了" → slot_ops 删除相关字段（如 DELETE budget）{slots_hint}{ctx}
 
-可选意图: {", ".join(c.value for c in IntentCategory)}
-可选情绪: {", ".join(s.value for s in Sentiment)}
+用户消息: "{message}"""
 
-注意区分以下容易混淆的情况：
-- 用户报预算但没说要买 → intent=price_inq（不是 purchase）
-- 用户质疑产品效果但没赶人 → sentiment=skeptical（不是 negative）
-- "滚滚滚" / "骗子" 才是 negative；"你确定吗" 只是 skeptical
-- 纯数字手机号 → intent=contact_give"""
         prompt = self._clean_text(prompt)
 
         try:
             resp = await self.client.messages.create(
                 model=self.model,
-                max_tokens=256,
+                max_tokens=512,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = resp.content[0].text
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
-            try:
-                data["intent"] = IntentCategory(data["intent"])
-            except (ValueError, KeyError):
-                data["intent"] = IntentCategory.CHITCHAT
-            try:
-                data["sentiment"] = Sentiment(data.get("sentiment", "neutral"))
-            except ValueError:
-                data["sentiment"] = Sentiment.NEUTRAL
-            return data
         except Exception as ex:
-            logger.warning(f"LLM 识别失败: {ex}")
-            return {
-                "intent": IntentCategory.CHITCHAT,
-                "sentiment": Sentiment.NEUTRAL,
-                "confidence": 0.0,
-                "reasoning": "LLM 失败",
-                "failed": True,
-            }
-
-    # ── 策略 2：Embedding 向量匹配 ────────────────────────────────────────────
-
-    async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
-        """策略 2：Embedding 向量相似度匹配（只匹配 intent）。"""
-        try:
-            await self._load_template_embeddings()
-            msg_vec = await self._embed_text(message)
-
-            best_cat, best_score = IntentCategory.CHITCHAT, 0.0
-            for cat, vecs in self._tpl_embeddings.items():
-                score = max(_cosine(msg_vec, v) for v in vecs)
-                if score > best_score:
-                    best_score, best_cat = score, cat
-
-            return {"intent": best_cat, "confidence": best_score}
-        except Exception as ex:
-            logger.warning(f"Embedding 识别失败: {ex}")
-            return {"intent": IntentCategory.CHITCHAT, "confidence": 0.0}
-
-    # ── 策略 3：Pattern 匹配 ─────────────────────────────────────────────────
-
-    def _pattern_recognize(self, message: str) -> Dict[str, Any]:
-        """策略 3：关键词/正则匹配（同步，零延迟兜底）。"""
-        msg = message.lower()
-        scores: Dict[IntentCategory, float] = {}
-
-        for cat, kws in _PATTERNS.items():
-            hits = 0
-            for kw in kws:
-                if _match_regex(kw, msg):
-                    hits += 1
-            if hits:
-                scores[cat] = hits / len(kws)
-
-        if not scores:
-            return {"intent": IntentCategory.CHITCHAT, "confidence": 0.0}
-
-        best = max(scores, key=scores.get)  # type: ignore[arg-type]
-        return {"intent": best, "confidence": scores[best]}
-
-    # ── 意图投票（已注释 — 当前仅使用 LLM 单路，三路融合暂不使用）──────────
-
-    # def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> IntentCategory:
-    #     """加权投票合成 intent。sentiment 不走投票流程。"""
-    #     if llm.get("failed"):
-    #         if emb.get("intent", IntentCategory.CHITCHAT) != IntentCategory.CHITCHAT and \
-    #            emb.get("confidence", 0.0) > 0:
-    #             return emb["intent"]
-    #         if pat.get("intent", IntentCategory.CHITCHAT) != IntentCategory.CHITCHAT and \
-    #            pat.get("confidence", 0.0) > 0:
-    #             return pat["intent"]
-    #         return IntentCategory.CHITCHAT
-    #
-    #     if self._embedding_enabled:
-    #         weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]
-    #     else:
-    #         weights = [(llm, 0.85), (pat, 0.15)]
-    #     scores: Dict[IntentCategory, float] = {}
-    #
-    #     for result, w in weights:
-    #         cat  = result.get("intent", IntentCategory.CHITCHAT)
-    #         conf = result.get("confidence", 0.0)
-    #         scores[cat] = scores.get(cat, 0.0) + w * conf
-    #
-    #     best = max(scores, key=scores.get)  # type: ignore[arg-type]
-    #     return best if scores[best] >= self.threshold else IntentCategory.CHITCHAT
-
-    def _vote_sentiment(self, llm: Dict, message: str) -> Sentiment:
-        """
-        Sentiment 以 LLM 为准；Pattern 只在 LLM 失败时做兜底。
-        因为情绪判断依赖语义理解，不能靠关键词硬匹配。
-        """
-        sent = llm.get("sentiment", Sentiment.NEUTRAL)
-        if isinstance(sent, Sentiment):
-            return sent
-
-        # LLM 给出的字符串，尝试映射
-        if isinstance(sent, str):
-            try:
-                return Sentiment(sent)
-            except ValueError:
-                pass
-
-        # LLM 失败 → Pattern 兜底
-        msg = message.lower()
-        for s, kws in _SENTIMENT_PATTERNS.items():
-            if any(kw in msg for kw in kws):
-                return s
-        return Sentiment.NEUTRAL
-
-    # ── 实体提取 ──────────────────────────────────────────────────────────────
-
-    async def _extract_entities(self, message: str,
-                                intent: IntentCategory) -> Dict[str, List[str]]:
-        """
-        用 LLM 从消息中提取结构化实体。
-
-        留资场景关注: phone, wechat, budget, product, name。
-        """
-        message = self._clean_text(message)
-        prompt = f"""从用户消息中提取实体，返回 JSON（字段值为列表，没有则为空列表）:
-消息: "{message}"
-格式: {{"phone":[],"wechat":[],"name":[],"product":[],"budget":[],"error_code":[]}}
-其中 phone 匹配手机号（1开头11位），wechat 匹配微信号。"""
-        prompt = self._clean_text(prompt)
-        try:
-            resp = await self.client.messages.create(
-                model=self.model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            logger.warning(f"Planner LLM 调用失败: {ex}")
+            return PlannerOutput(
+                primary_intent=IntentCategory.CHITCHAT.value,
+                sub_tasks=["GREETING"],
+                slot_ops=[],
+                emotion=Sentiment.NEUTRAL.value,
+                confidence=0.0,
+                reasoning=f"Planner 失败: {ex}",
             )
-            raw = resp.content[0].text
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            return json.loads(raw[s:e])
-        except Exception:
-            # 用正则兜底提取手机号
-            phones = re.findall(r"1[3-9]\d{9}", message)
-            return {"phone": phones, "wechat": [], "name": [], "product": [], "budget": [], "error_code": []}
 
-    # ── 紧急度 ────────────────────────────────────────────────────────────────
+        # 解析并校验
+        primary = data.get("primary_intent", IntentCategory.CHITCHAT.value)
+        if isinstance(primary, str):
+            # 验证是否合法的 IntentCategory
+            valid_intents = {c.value for c in IntentCategory}
+            if primary not in valid_intents:
+                primary = IntentCategory.CHITCHAT.value
 
-    def _urgency(self, message: str, intent: IntentCategory,
-                 sentiment: Sentiment) -> UrgencyLevel:
-        """基于意图+情绪推导紧急度，不做关键词匹配。"""
-        if sentiment == Sentiment.NEGATIVE and intent == IntentCategory.COMPLAINT:
-            return UrgencyLevel.HIGH
-        if sentiment == Sentiment.NEGATIVE:
-            return UrgencyLevel.MEDIUM
-        return UrgencyLevel.LOW
+        sub_tasks = data.get("sub_tasks", [])
+        if not isinstance(sub_tasks, list):
+            sub_tasks = [primary]
 
-    # ── 辅助 ──────────────────────────────────────────────────────────────────
+        emotion = data.get("emotion", Sentiment.NEUTRAL.value)
+        valid_emotions = {s.value for s in Sentiment}
+        if emotion not in valid_emotions:
+            emotion = Sentiment.NEUTRAL.value
 
-    async def _load_template_embeddings(self) -> None:
-        """懒加载所有模板的 Embedding。"""
-        missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
-        if not missing:
-            return
+        # 解析 slot_ops
+        slot_ops = []
+        raw_ops = data.get("slot_ops", [])
+        if isinstance(raw_ops, list):
+            for op in raw_ops:
+                try:
+                    op_type = SlotOpType(op.get("op", "SET"))
+                    slot_ops.append(SlotOp(
+                        op=op_type,
+                        slot=str(op.get("slot", "")),
+                        value=op.get("value"),
+                    ))
+                except (ValueError, KeyError):
+                    continue
 
-        all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
-        vecs = [await self._embed_text(text) for text in all_texts]
-        idx = 0
-        for cat in missing:
-            n = len(_TEMPLATES[cat])
-            self._tpl_embeddings[cat] = vecs[idx: idx + n]
-            idx += n
+        return PlannerOutput(
+            primary_intent=primary,
+            sub_tasks=sub_tasks,
+            slot_ops=slot_ops,
+            emotion=emotion,
+            confidence=float(data.get("confidence", 0.8)),
+            reasoning=data.get("reasoning", ""),
+        )
 
-    async def _embed_text(self, text: str) -> List[float]:
-        """生成文本向量。远端不可用时回退本地 n-gram 哈希向量。"""
-        embeddings = getattr(self.client, "embeddings", None)
-        if embeddings is not None:
-            try:
-                resp = await embeddings.create(model="voyage-3-lite", input=[text])
-                return list(resp.data[0].embedding)
-            except Exception as ex:
-                logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
-
-        return self._local_embedding(text)
-
-    @staticmethod
-    def _local_embedding(text: str, dims: int = 256) -> List[float]:
-        """稳定的字符 n-gram 哈希向量。"""
-        normalized = text.lower().strip()
-        vec = [0.0] * dims
-        tokens = set()
-        for n in (1, 2, 3):
-            if len(normalized) >= n:
-                tokens.update(normalized[i:i + n] for i in range(len(normalized) - n + 1))
-        if not tokens:
-            tokens.add(normalized)
-
-        for token in tokens:
-            digest = hashlib.md5(token.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:4], "big") % dims
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vec[idx] += sign
-        return vec
-
-    def _cache_key(self, message: str) -> str:
-        return self._clean_text(message)[:200]
+    # ── 辅助 ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def _clean_text(value: Any) -> str:
-        """移除 Unicode 代理字符。"""
         if value is None:
             return ""
         if not isinstance(value, str):
             value = str(value)
         return value.encode("utf-8", errors="ignore").decode("utf-8")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 向后兼容 — IntentRecognizer 包装为 Planner 的别名
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class IntentRecognizer:
+    """
+    向后兼容包装器（旧版 IntentRecognizer 接口）。
+    内部使用 Planner，输出转为旧的 IntentResult 格式。
+
+    新代码请直接使用 Planner。
+    """
+
+    def __init__(self, api_key: str, base_url: Optional[str] = None,
+                 model: str = "claude-3-5-sonnet-20241022",
+                 confidence_threshold: float = 0.5):
+        self._planner = Planner(api_key=api_key, base_url=base_url, model=model)
+        self.threshold = confidence_threshold
+        self._cache: Dict[str, IntentResult] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    async def recognize(
+        self,
+        message: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> IntentResult:
+        """输出旧版 IntentResult（供 evaluator 等模块使用）。"""
+        t0 = time.monotonic()
+        plan = await self._planner.plan(message, history=history)
+
+        # 将 Planner 输出转回旧的 IntentResult 格式
+        try:
+            intent = IntentCategory(plan.primary_intent)
+        except (ValueError, KeyError):
+            intent = IntentCategory.CHITCHAT
+
+        try:
+            sentiment = Sentiment(plan.emotion)
+        except (ValueError, KeyError):
+            sentiment = Sentiment.NEUTRAL
+
+        entities: Dict[str, List[str]] = {}
+        for op in plan.slot_ops:
+            if op.op == SlotOpType.SET and op.value is not None:
+                entities.setdefault(op.slot, []).append(str(op.value))
+
+        urgency = self._calc_urgency(intent, sentiment)
+
+        return IntentResult(
+            intent=intent,
+            sentiment=sentiment,
+            confidence=plan.confidence,
+            urgency=urgency,
+            entities=entities,
+            reasoning=plan.reasoning,
+            latency_ms=(time.monotonic() - t0) * 1000,
+        )
+
+    @staticmethod
+    def _calc_urgency(intent: IntentCategory, sentiment: Sentiment) -> UrgencyLevel:
+        if sentiment == Sentiment.NEGATIVE and intent == IntentCategory.COMPLAINT:
+            return UrgencyLevel.HIGH
+        if sentiment == Sentiment.NEGATIVE:
+            return UrgencyLevel.MEDIUM
+        return UrgencyLevel.LOW
+
+    # 保持旧的 Pattern / Embedding 方法签名（不实现，保持兼容）
+    def learn(self, message: str, correct_intent: IntentCategory,
+              correct_sentiment: Sentiment = Sentiment.NEUTRAL) -> None:
+        logger.info(f"学习接口已调用（Planner 模式下 learn 暂不生效）: {message[:40]}")
+
     @property
     def cache_stats(self) -> Dict[str, Any]:
-        total = self.cache_hits + self.cache_misses
-        return {
-            "size": len(self._cache),
-            "hits": self.cache_hits,
-            "misses": self.cache_misses,
-            "hit_rate": self.cache_hits / total if total else 0.0,
-        }
+        return {"size": len(self._cache), "hits": self.cache_hits, "misses": self.cache_misses, "hit_rate": 0.0}

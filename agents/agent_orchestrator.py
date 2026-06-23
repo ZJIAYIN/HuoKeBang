@@ -254,15 +254,12 @@ class AgentOrchestrator:
 
     def __init__(
         self,
-        api_key:  str,
-        base_url: Optional[str] = None,
-        model:    str = "claude-3-5-sonnet-20241022",
         redis_url: Optional[str] = None,
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        api_key = "sk-92f09f3ada494ecd8390763ff293906b"
+        base_url = "https://api.deepseek.com/anthropic"
+        model = "deepseek-chat"
+        client = AsyncAnthropic(api_key=api_key, base_url=base_url)
 
         self._intent_recognizer = IntentRecognizer(
             api_key=api_key, base_url=base_url, model=model,

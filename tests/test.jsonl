@@ -1,0 +1,5 @@
+{"query": "你好呀，我想了解一下新款M9的落地价和配置，还想问问能不能免息分期", "sub_tasks": ["GREETING", "PRODUCT", "PRICE"], "slots": {"model": "M9"}}
+{"query": "哈喽，打扰一下，我预算25万，想看看新款车型的参数，同时咨询下购车全款优惠", "sub_tasks": ["GREETING", "PRODUCT", "PRICE"], "slots": {"budget": "25万"}}
+{"query": "您好，之前咨询过M8的配置，现在想问问分期方案，另外投诉一下之前回复不及时", "sub_tasks": ["GREETING", "PRODUCT", "PRICE", "COMPLAINT"], "slots": {"model": "M8", "issue": "客服回复不及时"}}
+{"query": "早上好，我想了解M7的内饰配置、官方售价，还想问问能不能上门试驾留联系方式", "sub_tasks": ["GREETING", "PRODUCT", "PRICE", "LEAD_CAPTURE"], "slots": {"model": "M7"}}
+{"query": "你好，我对比了好几款车型，想问问M9顶配落地多少钱，有没有购车福利，怎么下单", "sub_tasks": ["GREETING", "PRICE", "PURCHASE"], "slots": {"model": "M9"}}

@@ -30,21 +30,26 @@
 
 #### 第 2 段：核心链路（30 秒）
 
-> "整体流程分四步：
-> **第一步**是意图识别——用户发一句话，我们同时判断他的意图和情绪，比如他是来询价的、还是投诉的，情绪是积极的还是犹豫的；
-> **第二步**根据意图路由到不同的 Agent——询价的走 ConsultAgent 做专业解答，给联系方式了就走 LeadCaptureAgent 确认存储，情绪差就走 EscalationAgent 安抚；
-> **第三步**是 RAG 检索——涉及业务知识的提问，会走查询改写、混合检索、重排这条链路从知识库里找答案；
-> **第四步**是留资决策——结合意图和情绪判断当前适不适合引导留资，同时更新用户画像供后续对话使用。"
+> "整体流程分三层：
+> **第一层是理解——Planner（LLM）**：用户发一句话，Planner 同时做三件事——识别多标签意图（比如用户既问价格又投诉）、提取关键槽位（车型、预算等）、判断情绪。输出是一组 sub_task + slot_ops + emotion。
+>
+> **第二层是编排——Orchestrator（纯代码）**：把 Planner 输出的 sub_task 映射到对应的 **Skill**。每个 Skill 是一份"元数据"——声明它需要什么槽位、调什么工具、完成什么任务。Orchestrator 检查槽位是否满足、把多个 Skill 的工具需求收集起来**去重执行**（比如两个 Skill 都需要 RAG，只查一次），然后把所有可执行的指令合并，传给 Response Agent。
+>
+> **第三层是生成——Response Agent（LLM）**：纯生成，根据收到的指令列表和上下文一次输出完整回复，不做任何逻辑判断。"
 
-**为什么好：** 用"第一步→第二步→第三步→第四步"串起来，逻辑清晰，面试官能跟上。
+**为什么好：** 三层职责清晰——理解归 Planner、编排归 Orchestrator（纯代码零幻觉）、生成归 Response Agent。面试官一听就知道架构有设计感。
 
 ---
 
 #### 第 3 段：深度亮点（60 秒）—— 选 1-2 个展开
 
-**亮点 A：意图识别的二维矩阵**
+**亮点 A：Skill 可插拔架构——动态组装 System Prompt**
 
-> "我重点做了意图识别这块。传统的客服系统只分意图，但留资场景里情绪同样关键——用户说'太贵了'，光知道他是询价不够，还得知道他是在犹豫还是在嫌贵。所以我设计了一个**意图×情绪的二维矩阵**：9 种意图 × 5 种情绪，LLM 一次输出两个标签。然后拿这个矩阵去做留资时机决策——比如 PURCHASE + POSITIVE 就一定要引导，SKEPTICAL 就先答疑不急着要联系方式。转人工也是看这个矩阵触发的。"
+> "我重点做了架构设计这一块。传统客服系统要么写死 prompt，要么用 if-else 路由到不同 Agent。但我们的场景是**多意图交叉**——用户可能一句话里既问价格又投诉还留了电话，用 if-else 路由根本处理不了。
+>
+> 我的方案是 **Skill 可插拔机制**：每个 Skill 是一份纯元数据，只声明三样东西——需要的槽位、需要的工具、要完成的任务说明。Orchestrator 遍历 Planner 输出的 sub_task 列表，去注册表里匹配 Skill，检查槽位是否满足，把多个 Skill 的 instruction 合并成一份 System Prompt 交给 Response Agent。
+>
+> 这样做有三个好处：**第一是新意图零成本接入**——写一个新的 Skill 类注册进去就行，不用改链路代码；**第二是工具去重**——多个 Skill 需要 RAG 时只执行一次，不浪费；**第三是槽位引导自动化**——Skill 声明了缺少哪些槽位，Orchestrator 自动在 prompt 里追加追问指令，不需要写死对话流程。"
 
 **亮点 B：检索链路的优化**
 
@@ -52,7 +57,13 @@
 
 **亮点 C：评测体系 + 数据闭环**
 
-> "我觉得光做功能不够，得能证明它有效。所以我搭了一套端到端的评测体系：先离线跑 Golden Test Set 算准确率和 Macro-F1（363 条人工标注的用例），线上对话则用 LLM-as-Judge 从相关性、准确性、完整性、有用性四个维度打分。更关键的是**数据闭环**——线上每一条预测结果都持久化下来，抽 Bad Case 人工修正后补充到训练集里，为后续本地模型微调做准备。"
+> "我觉得光做功能不够，得能证明它有效。我搭了两层评测：
+>
+> **第一层是多意图评测**——因为我们的场景是**多标签分类**（一个 query 可能同时命中 PRICE、PRODUCT、COMPLAINT），传统单意图的 Accuracy 就没法用了。我设计了新的评估方案：对每个 sub_task 名字独立算 TP/FP/FN，然后汇总成 Macro Precision/Recall/F1，再加一个 Exact Match Rate 看集合完全一致的比例。槽位提取也用同样的混淆矩阵思路，但比较的是"槽位名 + 值是否完全匹配"。
+>
+> **第二层是 LLM-as-Judge 质量评估**——用 LLM 当裁判，从相关性、准确性、完整性、有用性四个维度给回复打分。
+>
+> 更关键的是**数据闭环**——线上每一条 Planner 输出（意图、槽位、情绪）都持久化到 JSONL，抽 Bad Case 人工修正后补充到测试集和训练集里，为后续本地模型微调做准备。"
 
 ---
 
@@ -66,11 +77,11 @@
 
 > "这个项目是一个**留资型智能客服系统**，用户在看车选车过程中提问题，系统要实时判断对方是不是潜在客户，是的话就在回答中自然引导留资，同时把对话数据沉淀下来持续优化。
 >
-> 整体流程分四步：**第一步**是意图识别——用户发一句话，我们同时判断他的意图和情绪，比如他是来询价的还是投诉的，情绪是积极还是犹豫；**第二步**根据意图路由到不同的 Agent——询价的走 ConsultAgent，给联系方式了走 LeadCaptureAgent，情绪差走 EscalationAgent 安抚；**第三步**是 RAG 检索——涉及业务知识的提问，会走查询改写、混合检索、重排这条链路从知识库里找答案；**第四步**是留资决策，结合意图和情绪判断时机。
+> **架构上采用三层解耦设计。第一层是 Planner（LLM）**——用户发一句话，它同时做多标签意图识别、槽位提取和情绪判断，输出一组 sub_task + slot_ops + emotion。**第二层是 Orchestrator（纯代码）**——把 sub_task 映射到 Skill 元数据，检查槽位是否满足，收集工具需求去重执行，然后把可执行的指令合并传给生成层。**第三层是 Response Agent（LLM）**——纯生成，根据指令一次输出完整回复。
 >
-> 我重点做了两块。**第一块是意图识别**——设计了意图×情绪的二维矩阵，LLM 一次输出两个标签，然后拿这个矩阵做留资决策和 Agent 路由的依据。**第二块是检索链路的优化**——向量 + BM25 混合检索走 RRF 融合，上层 LLM 重排，再加查询改写提升召回率。另外我还搭了一套评测体系来实现数据闭环：线上预测结果持久化下来，抽 Bad Case 人工修正后补充到训练集里，为后续本地模型微调做准备。
+> 我重点做了两块。**第一块是 Skill 可插拔架构。** 每个 Skill 是纯元数据——声明需要的槽位、工具和任务说明。新意图来了写个新 Skill 注册就行，不用改链路代码。多个 Skill 需要 RAG 时 Orchestrator 只执行一次，不浪费。槽位没补齐的话自动在回复里追问，不需要写死对话流程。**第二块是多意图评测体系。** 对每个 sub_task 独立算 TP/FP/FN，汇总成 Macro F1 和 Exact Match Rate，槽位提取也用同样的混淆矩阵方案。
 >
-> 整体上就是意图做精、检索做全、效果可量化、数据能回流。"
+> 整体上就是架构解耦、效果可量化、数据能回流。"
 
 ---
 
@@ -102,61 +113,194 @@
 
 ---
 
-## 意图识别
+## 理解层（Planner）— 多标签意图 + 槽位提取
 
 ### 面试话术
 
-> **"意图识别这块我核心的思路是：不单单让大模型判断当前这一句话，而是尽量提供完整的上下文语义和参考信息。** 传统的意图分类只传当前 query，但在对话场景里脱离上下文很容易误判。比如用户只说"那算了"——单看这句话看不出意图，但结合前面聊的产品和价格就能知道他是放弃购买还是在压价。
+> **"Planner 的核心任务不是简单分类，而是把用户的一句话拆解成三个结构化输出：sub_tasks（多标签意图）、slot_ops（槽位操作）、emotion（情绪）。**
 >
-> 我的做法是把三个信息拼在一起送给大模型：
-> **第一是工作记忆里的多轮会话**——从 Redis 取出最近的消息历史，让模型知道对话上下文；
-> **第二是当前的 query**——用户这次具体说了什么；
-> **第三是内置的 few-shot 示例**——每个意图和情绪标签都给了一个典型例子，避免模型自由发挥。
+> **Sub_task 是多标签的**——用户说"我想了解一下新款 M9 的落地价和配置，另外之前有个投诉回复不及时"，Planner 要一次输出 PRICE、PRODUCT、COMPLAINT 三个标签，而不是只取一个主要意图。少一个，对应的 Skill 就不会触发，下游就漏掉一个任务。
 >
-> 大模型一次输出两个标签：**意图 × 情绪**。意图有 9 种（询价、咨询参数、投诉、比价等），情绪有 5 种（正面、中性、犹豫、焦虑、负面）。
+> **Slot_ops 是提取关键信息**——车型、预算、联系电话、投诉内容等。这些槽位跨轮持久化到 Redis，用户在前面说了"我关注 M8"，后面只问"多少钱"，Planner 能看到已有槽位知道用户问的是 M8 多少钱。
 >
-> 拿到这个二维矩阵后，下游再去做两件事：**一是路由到对应的角色 Agent**——比如询价的走 ConsultAgent，投诉的走 EscalationAgent；**二是留资时机判断**——PURCHASE + POSITIVE 就一定引导，SKEPTICAL 就先答疑不急着要联系方式。这样整个链路就是从理解到决策串起来了。"
+> **Emotion 仍然保留**——情绪影响 Skill 的执行判断，比如情绪差时 LeadCaptureSkill 不会触发引导，COMPLAINT 的处理方式也会更温和。
+>
+> 输入侧我拼了三个信息：**当前 query + 历史摘要（工作记忆） + 已有槽位（Redis 持久化）**。用户说'那算了'，单看不行，但结合已有槽位和历史就知道他在比价还是放弃。
+>
+> 输出侧以**结构化的 slot_ops 序列**替代了旧的单标签分类。每个 slot_op 是个操作指令——SET phone='137xxxx' 或者 DELETE model。这种设计让下游 Orchestrator 可以直接应用槽位变更，不需要再做解析。"
 
 ### 可能的追问
 
-**Q：为什么不用传统的分类模型（BERT/textCNN）而是用大模型？**
-> 一开始考虑过，但意图×情绪的组合有 45 种，传统模型需要大量标注数据，而我们初期没有这个条件。大模型零样本能力就能做到，而且上下文窗口可以容纳多轮对话，准确率够用。后续 intent_logs.jsonl 积累起来后，可以作为训练数据微调一个本地小模型来降本。
+**Q：为什么不做单标签分类而是多标签？**
+> 客服场景天然是多意图的。用户说"M8 多少钱，能试驾吗，另外之前投诉处理好了没"——这涉及价格咨询、试驾预约、投诉跟进三个任务。单标签分类只能取一个，其他两个就丢了。多标签输出保证了每个任务都能命中对应的 Skill，回复时一次合并。
 
-**Q：你的 few-shot 示例怎么设计的？**
-> 每个意图和情绪标签配了一个典型对话片段作为例子。比如 INQUIRY_PRICE 的示例是"这款车落地多少钱？"，SENTIMENT_SKEPTICAL 的示例是"网上都说这车毛病多"，放在 system prompt 里。
+**Q：Planner 和旧架构的 IntentRecognizer 有什么区别？**
+> 旧架构只输出一个主要意图，然后根据这个意图路由到固定 Agent。Planner 输出的是**一组 sub_task**，不再有"唯一主要意图"的概念。下游 Orchestrator 遍历所有 sub_task 各自匹配 Skill，互不冲突。另外 Planner 还输出了 slot_ops 序列，Orchestrator 可以直接应用，不需要额外解析自然语言。
 
-**Q：如果有多个意图怎么处理？**
-> 目前是单标签分类，取置信度最高的。实际场景里一个 query 确实可能包含多个意图（比如问价格的同时问配置），后续迭代方向可以是多标签输出，或者把"咨询参数"和"比价"这类常见组合作为复合意图处理。
+**Q：Planner 用 deepseek-chat，稳定性能保证吗？**
+> 目前依赖远端 LLM，输出格式通过 system prompt 约束 + 少样本示例固定。线上每轮 Planner 的输出都持久化到 intent_logs.jsonl，用来做 Bad Case 分析和后续微调。如果格式稳定性不够，后续方案是加一层输出校验 + 重试逻辑，或者把积累的数据拿去微调一个小模型本地部署。
+
+**Q：槽位是怎么跨轮对话持久化的？**
+> slot_ops 应用到 SlotManager，SlotManager 支持双后端——有 Redis 时写 Redis Hash 带 7 天 TTL，Redis 不可用时降级到内存字典。所以 Planner 每次调用都能看到之前的槽位状态，不会因为换了对话轮次就丢失。
 
 ---
 
-## 留资时机决策
+## 留资时机决策 — LeadCaptureSkill + Redis 冷却窗口
 
 ### 面试话术
 
-> **"留资时机的判断我基于意图×情绪的二维矩阵来做，不是简单地看用户说了什么就推联系方式。** 核心逻辑在 `_should_ask_contact()` 这个方法里，三层过滤：
+> **"留资时机的判断不再是单独的决策函数，而是嵌入到 Skill 机制里的。核心是 LeadCaptureSkill 这个 Skill 和它的 `can_execute()` 方法。**
 >
-> **第一层：意图过滤。** 只有价格咨询（PRICE_INQ）、购买意向（PURCHASE）、产品咨询（PRODUCT_INQ）这三种意图才会考虑引导留资。像投诉、比价、对比竞品这些场景直接过滤掉，不骚扰用户。
+> **首先，LEAD_CAPTURE 这个 sub_task 是 Orchestrator 永远追加到列表里的**，不依赖 Planner 是否识别到。因为用户可能没有直接说要留电话，但对话进行到某个阶段时自然引出留资才是最佳时机。如果等 Planner 识别到"用户想留电话"再触发，那已经晚了。
 >
-> **第二层：情绪过滤。** 悲观（NEGATIVE）、焦虑（ANXIOUS）、犹豫（SKEPTICAL）的情绪也不会引导——用户都不爽了还追着要电话，体验太差。只有当情绪是正面或中性时才引导。特别是 PURCHASE + POSITIVE 这个组合，代码里是硬编码的，直接标记为必须引导。
+> **但永远追加不等于永远执行。** LeadCaptureSkill 用 `can_execute()` 做三层守门：
 >
-> **第三层：拒绝冷却窗口。** 用户如果明确说了"暂时不想留"、"再说吧"——意图识别会识别为 CONTACT_NO，系统在 Redis 里记一个时间戳（`lead:refused:{user_id}`，TTL 1 小时）。接下来 3 分钟内不会再问同一个人，冷却期过了才重新尝试。这个窗口时长是通过 `ASK_COOLDOWN = 3` 控制的，单位是分钟。
+> **第一层：槽位检查。** LeadCaptureSkill 声明了 `required_slots = ["phone", "wechat"]`——如果用户已经给过联系方式了，槽位齐全，Skill 标记为 completed，不再重复问。
 >
-> **这几层决策不是直接操作 Agent 的回复，而是通过 prompt 注入来影响 Agent**——如果决策为"适合留资"，就在系统指令里加一句"请在回答后自然引导留资"；不适合就加"专注解答用户疑问，先建立信任"。Agent 仍然是自由的，但有了这个上下文信号，回复会更贴合场景。"
+> **第二层：冷却窗口。** AgentEngine 在 run() 的第一步就检查 Redis——`lead_store.is_in_cooldown(user_id)`。如果用户在 24 小时内拒绝过留资（Redis Hash 有 TTL），会自动设置 `lead_refused=True` 到槽位里。LeadCaptureSkill 读到这个标记就不执行。
+>
+> **第三层：让 Response Agent 做决策。** 如果槽位没满足、也不在冷却期，Skill 的 instruction 会被注入到 System Prompt 里。但具体问不问、用什么话术问，是 Response Agent 根据对话语境自己决定的——Orchestrator 不硬编码任何"必须引导"的逻辑。
+>
+> **如果用户说了"暂时不想留"——Planner 识别出 CONTACT_NO，触发了 ContactNoSkill，它的 instruction 告诉 Agent 尊重用户意愿不要追问。同时 AgentEngine 在 run() 末尾调用 `lead_store.record_refusal(user_id)`，Redis 记录一条带 24h TTL 的 key。下次同一个人对话时，`is_in_cooldown()` 返回 True，LeadCaptureSkill 自动 bypass。"
 
 ### 可能的追问
 
-**Q：冷却期过了又去问，用户再次拒绝怎么办？**
-> 每次拒绝都会刷新 Redis 里的时间戳，冷却窗口重新开始计时。不会无限制问下去——如果用户持续拒绝，每次都是 3 分钟后才再问一次，不会在同一轮对话里反复骚扰。
+**Q：为什么 LEAD_CAPTURE 要永远追加而不是等 Planner 识别？**
+> 留资的时机是对话中动态判断的，不是用户明确表达"我要留电话"才去做。用户问完价格、情绪不错，这时候可以引导——但 Planner 可能只会识别出 PRICE，不会凭空输出 LEAD_CAPTURE。所以我的做法是：LEAD_CAPTURE 永远在列表里，但 LeadCaptureSkill 自己守门，条件不满足自然不执行。这样既不会漏掉时机，也不会骚扰用户。
 
-**Q：那用户的意愿是通过什么来判断的？大模型？关键词匹配？**
-> 还是走意图识别这条链路。用户说"改天再说"、"先不加微信"之类的，意图识别会返回 CONTACT_NO。跟普通 query 一样经过 intent × sentiment 矩阵，没有特殊处理。
+**Q：冷却窗口的数据存在哪里？怎么跨会话？**
+> 存在 Redis，key 是 `lead:{user_id}:refused`，TTL=86400 秒（24小时）。Redis 天然跨会话，不需要额外的注入逻辑。冷却期内用户来了直接检查 exists，冷却期过了 Redis 自动删 key，不需要手动清理。如果用户之后留了电话，`is_in_cooldown()` 也会返回 False——都留过电话了还冷处理没道理。
 
-**Q：怎么避免用户在还没了解产品的情况下就被引导留资？**
-> 代码里 `_should_ask_contact` 的调用时机是在 Agent 回答**之前**，但实际上 `should_ask = True` 只是给 Agent 一个信号——"本轮适合引导"。Agent 的 system prompt 里有逻辑要求"先回答用户问题，再自然引导"，所以实际效果是先解答完疑问再要联系方式。另外 routing 上只有 CONSULT Agent（主力咨询）才会触发留资引导，GREETING 开场、ESCALATION 投诉处理都不会。
+**Q：留了电话之后存在哪里？**
+> 也是 Redis，key 是 `lead:{user_id}:phone`、`lead:{user_id}:wechat` 等，不带 TTL 永久保留。AgentEngine 在 run() 末尾检查当前槽位里有没有 phone 或 wechat，有就自动写入 Redis。后续运营可以从 Redis 导出留资线索。
 
-**Q：情绪是消极的情况下，有没有可能聊了几轮后情绪转好了再引导？**
-> 目前每轮对话都会重新走完整的意图识别 + `_should_ask_contact` 决策链路。所以这一轮情绪消极不引导，下一轮用户情绪好了、意图也匹配了，就会自动变成引导。不需要额外的状态机来维护。
+**Q：用户拒绝了一次之后，冷却期内又来问别的问题，LeadCaptureSkill 完全不触发？**
+> 对的。冷却期内 `lead_refused=True`，LeadCaptureSkill 的 `can_execute()` 返回 False，instruction 不会进 System Prompt。Response Agent 完全不会收到留资相关指令，专注回答用户当前的问题。24h 后 Redis key 过期，冷却解除，LeadCaptureSkill 恢复正常。
+
+---
+
+## 三层架构深度讲解（Planner → Orchestrator → Response Agent）
+
+### 架构概览
+
+> **"EchoMind 的核心架构是三层解耦：Planner（理解）→ Orchestrator（编排）→ Response Agent（生成）。** 每一层职责清晰，没有重叠。"
+>
+> ```ascii
+> 用户输入
+>    ↓
+> ┌──────────────────────┐
+> │  Planner (LLM)       │  多标签识别 + 槽位提取 + 情绪判断
+> │  输出: sub_tasks +   │
+> │        slot_ops +    │
+> │        emotion       │
+> └──────────┬───────────┘
+>            ↓
+> ┌──────────────────────┐
+> │  Orchestrator (代码)  │  Skill 匹配 → 槽位检查 → Tool 去重
+> │  输出: ResponseInput  │  → Instruction 合并
+> │        (纯结构化)    │
+> └──────────┬───────────┘
+>            ↓
+> ┌──────────────────────┐
+> │  Response Agent(LLM) │  根据 Instruction + Context 生成回复
+> │  输出: 自然语言       │
+> └──────────────────────┘
+>    ↓
+> 用户收到回复
+> ```
+
+### 为什么拆三层？
+
+> **"拆层的核心动机是：理解、编排、生成三个问题的性质完全不同，耦合在一起会互相拖累。**
+>
+> - **理解（Planner）** 需要 LLM 的语义能力，但它只是输出结构化数据（sub_tasks + slot_ops），不做对话生成。这样我可以独立迭代 few-shot 模板、调整标签体系，不影响回复风格。
+> - **编排（Orchestrator）** 是纯代码，没有 LLM 调用。它做 Skill 匹配、槽位检查、工具去重——这些都是确定性的逻辑，不应该交给 LLM，也不应该被 prompt 影响。纯代码意味着零幻觉、可测试、延迟可控。
+> - **生成（Response Agent）** 只负责一件事：根据收到的指令和上下文，生成自然流畅的回复。不做意图判断，不做工具调用，只做 NLG。
+>
+> 这样切之后，三个模块可以独立开发、独立测试。我想加一个新的意图，只需要写一个 Skill 类，Planner 加 few-shot，Orchestrator 不需要改一行代码。"
+
+### Planner 的输入输出
+
+> **"Planner 每次调用接收三个输入，输出三个结构化字段。**
+>
+> **输入：**
+> - **用户 query**：当前这轮用户说了什么
+> - **历史摘要**：从工作记忆（Redis）取出的最近对话，让 Planner 知道上下文
+> - **已有槽位**：从 SlotManager 取出的当前会话已有信息（车型、预算等），避免 Planner 重复提取
+>
+> **输出（PlannerOutput）：**
+> - **sub_tasks: List[str]** — 多标签意图列表，如 `["PRICE", "PRODUCT", "COMPLAINT"]`。每个 sub_task 对应一个 Skill。数量不限，一个 query 可以有零到多个。
+> - **slot_ops: List[SlotOp]** — 槽位操作序列，如 `[SET model=M8, SET budget=25万]`。下游 Orchestrator 直接 apply，不需要额外解析。
+> - **emotion: str** — 情绪标签，影响 Skill 的执行判断（如情绪差时 LeadCapture 不触发）。"
+
+### 追问
+
+**Q：Planner 和旧 IntentRecognizer 的区别？**
+> 输出从"一个主要意图"变成"多个 sub_task"，从"标签"变成"标签 + 槽位操作序列"。下游不再是路由到一个 Agent，而是遍历匹配所有的 Skill。这不仅仅是输出格式变了，是整个处理逻辑从"选一个"变成了"处理所有"。
+
+**Q：sub_tasks 的顺序有意义吗？**
+> 没有严格的顺序语义。Orchestrator 遍历 sub_tasks 列表，对每个 task 独立匹配 Skill，互不依赖。最终所有可执行的 instruction 会合并到 System Prompt 里，Response Agent 自己决定回复时怎么组织。
+
+### Skill 可插拔机制
+
+> **"Skill 是整个编排层的核心抽象。它不是传统的 'Agent' 或 'Tool'，而是一份纯元数据——只声明，不执行。"**
+>
+> ```python
+> class PriceSkill(BaseSkill):
+>     name = "PRICE"
+>     required_slots = ["model"]           # 需要知道车型才能报价
+>     required_tools = [Tool.RAG]          # 报价需要查知识库
+>     instruction = "根据已获取的信息和提供的知识，为用户提供专业、准确的价格咨询"
+> ```
+>
+> **每个 Skill 声明三样东西：**
+>
+> 1. **required_slots / optional_slots** — 需要什么槽位。Orchestrator 用 `check_slots()` 检查是否满足，缺失的槽位自动进入 pending，在回复末尾追问。
+> 2. **required_tools** — 需要调什么工具（RAG、CRM 等）。Orchestrator 收集所有 Skill 的工具需求，**去重后统一执行一次**。
+> 3. **instruction** — 给 Response Agent 的指令文本。多个 Skill 的 instruction 合并成 System Prompt 里的"任务"部分。
+>
+> **没有 execute() 方法。** 因为客服场景的多任务是合并生成，不是顺序执行。用户说"多少钱 + 投诉"，不是先报价再处理投诉，而是一次回复包含价格和安抚。所以 Skill 不需要自己执行，只需要告诉 Orchestrator 要完成什么任务。
+>
+> **新意图零成本接入**：写一个新 Skill 类，注册到 SkillRegistry，Planner 加 few-shot 示例。不需要改链路代码。
+
+### 追问
+
+**Q：Skill 没有 execute()，那它怎么执行任务？**
+> 它不执行，它"声明"。真实的执行者是 Response Agent——一个 Skill 的 instruction 被注入到 System Prompt 里，Response Agent 读取后自主完成。Orchestrator 负责的是"确保条件满足（槽位齐全、工具结果拿到）"，不负责"执行具体业务逻辑"。
+
+**Q：多个 Skill 都需要 RAG，怎么防止重复检索？**
+> Orchestrator 遍历 sub_tasks 时，把所有 Skill 的 `required_tools` 收集到一个 `set` 里——`set` 天然去重。然后统一调 `ToolLayer.exec_tools(required_tools=list(all_tools), ...)`。RAG 只执行一次，检索结果共享给所有需要它的 Skill。代码里就是一行 `all_tools.update(skill.required_tools)`。
+
+**Q：槽位缺失时怎么引导用户补充？**
+> `skill.check_slots(slots)` 返回缺失列表。如果缺了，这个 Skill 进入 pending，缺失槽位信息放在 ResponseInput 的 pending 字段里。Response Agent 的 System Prompt 会被追加一句——"PRICE: 缺少 model，在回复末尾自然追问"。Agent 自主决定怎么问、什么时候问，Orchestrator 不写死话术。
+
+### Orchestrator 的执行流程
+
+> **"Orchestrator 的执行步骤是纯代码，每一步都是确定性的：**
+>
+> 1. **应用 slot_ops** — Planner 输出的槽位操作序列直接写到 SlotManager，更新当前会话的槽位状态
+> 2. **始终追加 LEAD_CAPTURE** — 如果 sub_tasks 里没有 LEAD_CAPTURE，自动追加。确保 LeadCapture 指令永远在 prompt 里
+> 3. **遍历 sub_tasks** — 对每个 sub_task，去 SkillRegistry 匹配对应的 Skill 类
+> 4. **检查情绪** — 某些 Skill 可能限制特定情绪才触发
+> 5. **检查槽位** — `skill.check_slots(slots)` 看必需槽位是否齐全
+> 6. **收集 instruction** — 可执行的 Skill 把 instruction 加入列表
+> 7. **收集 tools 去重** — 所有 Skill 的 required_tools 合并到一个 set
+> 8. **执行 Tool Layer** — 统一执行一次所有需要的工具（当前是 RAG）
+> 9. **构建 ResponseInput** — 打包 instructions、knowledge、pending、slots 等传给 Response Agent"
+
+### Response Agent
+
+> **"Response Agent 是三层里最简单的一层——它只生成回复。收到的输入是别人替它准备好的：要完成什么任务（instructions）、有什么知识（knowledge）、当前槽位状态（slots）、用户情绪（emotion）、缺失信息（pending）。它不做任何逻辑判断，只做 NLG。**
+>
+> **System Prompt 的组装逻辑：**
+> 1. 角色定义："你是 EchoMind 智能客服助手"
+> 2. 任务列表：所有可执行 Skill 的 instruction，逐条列出
+> 3. 待办提醒：pending 中的缺失信息，提示 Agent 在回复末尾追问
+> 4. 统一回复规范：语气专业亲和、先安抚后回复、不编造知识等
+>
+> **User Message 里包含：** 用户原始消息、RAG 检索结果、当前槽位 JSON、情绪标签、用户画像。
+>
+> 全部拼好后一次调用 LLM，生成完整回复。它不需要多轮推理，不需要工具调用，就是一次生成。"
 
 ---
 
@@ -164,27 +308,29 @@
 
 ### 面试话术
 
-> **"这个项目里我觉得做得比较好的地方是搭了一套端到端的意图识别评测体系。** 因为意图识别的准确率很大程度上取决于 few-shot 示例设得准不准，线上出现 Bad Case 就要微调提示词。但怎么判断调整是变好了还是变坏了？不能靠感觉。所以我事先给每个意图都标注了常见的 query，做成 Golden Truth Set——一共 363 条人工标注用例。每次改完 prompt 就重跑这些测试集，看指标有没有回退。
+> **"这个项目里我觉得做得比较好的地方是搭了一套完整的评测体系。因为系统涉及多标签意图识别、槽位提取和 RAG 检索三个维度，每个维度都需要量化才能迭代。**
 >
-> **指标上我重点看两个：Accuracy 和 Macro-F1。** 只看 Accuracy 是不够的——比如某类意图的测试用例特别多，Accuracy 可能被它拉上去，但小类全分错了也看不出来。所以我用 Macro-F1，先算每个类别自己的 F1（精确率和召回率的调和平均），再对所有类别取平均。这样每个类别是平等对待的，少数类的表现不好一眼就能看到。代码里是纯 Python 实现，逐类算 TP/FP/FN，然后算 precision、recall、f1。
+> **第一个维度是多标签意图评测。** 传统的单标签 Accuracy 在我们的场景里不适用——用户一句话可能同时命中 PRICE、PRODUCT、COMPLAINT 三个标签，用"猜对主要意图"来评估会漏掉次要意图的表现。所以我自己设计了一套方案：测试集用 JSONL 格式，每条标注了预期的 sub_tasks 列表和 slots 字典。对每个 sub_task 名字（PRICE、PRODUCT 等）独立算 TP/FP/FN，然后汇总成 Macro Precision / Recall / F1。再加一个 Exact Match Rate，看"sub_task 集合完全一致"的用例占比。代码在 `evaluation/multi_intent_evaluator.py`，单遍扫描、动态建标签集合。
 >
-> **除了意图评测，还搭了一套 LLM-as-Judge 的质量评估。** 用 LLM 当裁判，从相关性、准确性、完整性、有用性四个维度给 Agent 的回复打分（0 到 1）。为什么要用 LLM 判？人工标注太贵、太慢、还不一致，LLM judge 可以规模化地跑。
+> **槽位提取也用同样的混淆矩阵方案**，但评估粒度是"槽位名 + 值是否完全匹配"。比如预期 `{"model": "M8"}`，预测 `{"model": "M8"}` 是 TP，预测 `{"model": "M9"}` 就既是 FP 也是 FN。`lead_refused` 这类系统推断的槽位排除在评估外——只看 CONTACT_NO 这个 sub_task 的识别准不准就够了，不需要单独评估它对应的槽位。
 >
-> **最重要的是基线对比和回归检测。** 每次评测结果会保存到 `data/eval/baseline.json`，下一次跑的时候自动跟基线比——哪个指标退了 5% 以上会标出来，还给出优化建议。这样改了提示词后是变好了还是变坏了，不是靠印象，而是有数据说话的。"
+> **第二个维度是 LLM-as-Judge 的回复质量评估。** 用 LLM 当裁判，从相关性、准确性、完整性、有用性四个维度给 Agent 的回复打分（0 到 1）。为什么要用 LLM 判？人工标注太贵太慢还不一致，LLM judge 可以规模化地跑。
+>
+> **最重要的是基线对比和回归检测。** 每次评测结果会保存到基线文件，下一次跑的时候自动跟基线比——哪个指标退了 5% 以上会标出来，还给出优化建议。这样改了 prompt 后是变好了还是变坏了，不是靠印象，而是有数据说话的。"
 
 ### 可能的追问
 
-**Q：那你的 Golden Truth Set 只有 363 条，够覆盖所有场景吗？**
-> 初期是够的，每个意图类别平均 30-40 条，能暴露大多数常见问题。但它不是一成不变的——线上 intent_logs.jsonl 会持续积累真实数据，定期从中抽 Bad Case 人工修正，补充到测试集里。所以测试集会随着时间越来越丰富。
+**Q：你的 Golden Test Set 有 128 条，够覆盖所有场景吗？**
+> 覆盖的是常见多意图组合——PRICE+PRODUCT、PRICE+COMPLAINT、GREETING+LEAD_CAPTURE 等。关键不是单次覆盖度，而是线上每轮 Planner 输出都持久化到 intent_logs.jsonl，定期从中抽 Bad Case 人工修正后补充到测试集里——测试集随着时间越来越丰富，不是做完一次就放着不动。
 
-**Q：为什么不用传统的分类模型（BERT）而是用大模型+评测？**
-> 传统模型需要大量标注数据才能训练，项目初期没这个条件。大模型零样本就能用，但可靠性和可复现性确实不如小模型。所以我的思路是先靠大模型跑起来，同时通过评测体系把线上数据沉淀下来——intent_logs.jsonl 里的每条记录包含意图、情绪、推理过程。数据够了之后就可以用这些真实标注数据去微调一个本地的小模型，成本更低、响应更快、效果也更稳定。
+**Q：多标签评测和单标签有什么本质区别？**
+> 单标签只要看"猜对了没有"就行，多标签要处理的是部分正确的情况。比如预期三个标签、只猜对了两个——传统的 Accuracy 会算成错，但 Macro F1 会告诉你具体哪个标签没命中。而且 our 的标签集合是动态的——测试集跑完之后才知道一共出现多少个不同的 sub_task，每出现一个新标签就动态加到混淆矩阵里，不需要事先定义标签空间。
+
+**Q：槽位评估为什么排除 lead_refused？**
+> 因为 lead_refused 是系统推断的槽位——是 AgentEngine 检测到 Redis 冷却后自动设置的，用户不会在对话里说"lead_refused"这个词。评估它没有意义。关键是看 CONTACT_NO 这个 sub_task 的识别准不准——用户说了"先不加微信"，Planner 能不能正确识别为 CONTACT_NO。sub_task 准了，槽位自然就对了。
 
 **Q：LLM-as-Judge 本身也有偏差，怎么保证它的评分是可信的？**
 > 你说得对，LLM Judge 本身确实有偏好。目前的做法是定期间隔抽一些评分结果跟人工复核对比，如果发现系统性偏差就调整 judge prompt。另外评测的核心不是追求评分绝对准确，而是**相对基准**——同一套 judge 逻辑，改 prompt 前后跑出来的分差是有参考意义的。只要 judge 设置不变，回归检测就能工作。
-
-**Q：回归检测的阈值 5% 是怎么定的？**
-> 经验值。设太小（比如 1%）会频繁报警，大部分是随机波动不是真退化；设太大又可能漏掉真正的问题。5% 在实际跑下来是一个比较合理的平衡点。代码里 `_detect_regressions` 就是干这件事的——比上一次或者基线，差超过 5% 就标记。
 
 ---
 
@@ -198,15 +344,15 @@
 
 ### 1. 模型选型：为什么用 LLM，不用 BERT 这类分类模型？
 
-> **"意图识别这块，最直觉的方案是 BERT/textCNN 做分类模型——轻量、快、稳定。但我没有选，原因有三：**
+> **"理解层（Planner）我选 LLM 而不是传统分类模型，核心原因有三：**
 >
-> **第一，冷启动问题。** 意图×情绪有 9×5=45 种组合，传统分类模型每个组合至少需要几十条标注数据才能训练，项目初期没这个条件。LLM 零样本能力就能跑起来，先上线验证。
+> **第一，输出结构复杂。** Planner 要同时输出多标签 sub_tasks、slot_ops 序列和 emotion——这不是一个分类问题，而是一个**结构化生成**问题。BERT 输出的是类别概率分布，一次只能选一个标签，处理不了 "PRICE + PRODUCT + COMPLAINT" 这种多标签组合，更提取不了槽位。LLM 一次生成完整的结构化输出，天然适配。
 >
-> **第二，上下文理解能力。** 用户意图经常依赖多轮上下文——只说'那算了'，结合上几轮才能判断是放弃购买还是在压价。BERT 做单句分类天然丢失这个信息，LLM 可以用工作记忆里的多轮消息做判断。
+> **第二，冷启动和数据积累。** 多标签 + 槽位提取的场景需要大量标注数据才能训传统模型，项目初期没这个条件。LLM 零样本能力就能跑起来，先上线验证，同时通过 intent_logs.jsonl 积累数据，够量后再蒸馏到小模型降本。
 >
-> **第三，迭代速度。** 分类模型改一个类别要重新训练、重新部署。LLM 改几个 few-shot 示例就能调，配合评测体系验证效果。项目早期需求变化快，LLM 的灵活性很重要。
+> **第三，上下文理解。** 用户意图依赖多轮上下文——只说'那算了'，结合前面聊的产品和价格才能判断是放弃还是在压价。BERT 做单句分类天然丢失这个信息，LLM 可以用工作记忆和历史摘要做判断。
 >
-> **但这不是最终方案。** 线上 intent_logs.jsonl 一直在积累标注数据，够量之后可以蒸馏到一个小模型（比如 BERT 或者 0.5B 级别的 LLM）做本地部署，降成本、降延迟。"
+> **但这不是最终方案。** 线上 intent_logs.jsonl 一直在积累 Planner 的输入输出数据，够量之后可以蒸馏到一个小模型做本地部署。跟 BERT 不同，现在的数据是"对话上下文 → sub_tasks + slot_ops 序列"的多标签标注数据，可以做 seq2seq 微调。"
 
 ---
 
@@ -255,12 +401,11 @@
 
 | 追问 | 核心回答 |
 |---|---|
-| 为什么不用 BERT？ | 冷启动没标注数据 + LLM 能理解多轮上下文 + 迭代灵活 |
+| 为什么不用 BERT？ | 输出不是分类问题（多标签+槽位提取），是结构化生成；冷启动没标注数据；需要多轮上下文 |
 | 为什么不用 Milvus？ | 太重了，早期 ChromaDB 够用，docker-compose 里已经部署了 Milvus 为后续准备 |
 | 嵌入模型为什么用 all-MiniLM？ | ChromaDB 内置、免费、够用，不需要额外调接口 |
 | 为什么不用 ES 做关键词检索？ | 太重，纯 Python BM25 + jieba 几千文档够用，领域词典解决误拆 |
 | RRF 是什么？ | 倒数排名融合，只依赖排名不依赖分数，无需归一化异源结果 |
-| 三路融合为什么只用了 LLM 一路？ | 实测 LLM 单路准确率够用，embedding 和关键词有代码但没启用，避免过度设计 |
 | 后续演进方向？ | 积累标注数据蒸馏小模型 + 数据量大了切 Milvus/ES |
 | RRF 的 K 值怎么设的？ | 默认 60，K 越大排名靠后的文档越有机会被融合进来 |
 | BM25 的 k1、b 怎么设的？ | k1=1.5 控制词频饱和度，b=0.75 控制文档长度归一化，都是 BM25 论文的经典默认值 |
@@ -305,7 +450,7 @@
 >
 > **第一，抽象层次带来的调试成本。** LangChain 的抽象链（Chain、Runnable、Callback）封得比较厚，线上出了问题，你要从自己的业务代码一路追到 LangChain 的源码才能定位。比如 LLM 输出的解析失败、Callback 没触发、Memory 的 key 冲突——这些在框架里是黑盒。项目初期我们需要快速迭代、频繁调 prompt，每一层抽象都是排查问题的阻力。自己手写，每一行代码都知道在干什么，出问题能秒定位。
 >
-> **第二，80% 的场景用不到框架的复杂度。** 我的核心流程就四步：意图识别 → Agent 路由 → RAG 检索 → 留资决策。这些用 asyncio 就能串起来。LangChain 的 Chain、LangGraph 的 StateGraph、Agent Executor 确实可以编排更复杂的 DAG，但当前项目没有复杂的循环推理、多步工具调用、状态机切换的需求。用框架反而被它的抽象约束了。
+> **第二，80% 的场景用不到框架的复杂度。** 我的核心流程就三步：Planner（多标签识别）→ Orchestrator（Skill 编排）→ Response Agent（生成），用 asyncio 就能串起来。LangChain 的 Chain、LangGraph 的 StateGraph、Agent Executor 确实可以编排更复杂的 DAG，但当前项目没有复杂的循环推理、多步工具调用、状态机切换的需求。用框架反而被它的抽象约束了。
 >
 > **第三，依赖管理。** LangChain 的依赖树很重——你装一个 langchain，它会拉 langchain-community、langchain-core、各种 integration 包。而且 LangChain 的 API 变动频繁，0.1 到 0.2 到 0.3 大版本之间 breaking change 不少，锁版本升级都是负担。我们的依赖就是 anthropic + redis + chromadb + jieba，精简直观。
 >
@@ -434,17 +579,15 @@
 
 ### 16. LLM 调用失败的降级策略
 
-> **"我们的降级方案是用本地 Ollama 做远程大模型的兜底。** 当前项目的主力模型是远程 API（Claude），但完全依赖远程服务是有风险的——网络波动、API 限流、服务宕机都可能导致线上对话中断。所以我在本地部署了 Ollama 服务，作为降级链路。
+> **"我们的降级方案是用本地 Ollama 做远程大模型的兜底。** 当前项目的主力模型是远程 API（deepseek-chat），但完全依赖远程服务是有风险的——网络波动、API 限流、服务宕机都可能导致线上对话中断。所以我在本地部署了 Ollama 服务，作为降级链路。
 >
 > **降级链路分两层：**
 >
-> **第一层：意图识别降级。** IntentRecognizer 的 LLM 调用包在 try-except 里。如果远程 API 抛异常或者超时，请求自动路由到本地 Ollama（qwen2.5-7b）。Ollama 返回的结果格式跟远程保持一致——intent + sentiment 两个标签。这个降级对上游是透明的，Agent 层感知不到切换。如果 Ollama 也失败了，才返回安全默认值（CHITCHAT + NEUTRAL）。
+> **第一层：Planner（理解层）降级。** 如果远程 API 抛异常或者超时，请求自动切到本地 Ollama（qwen2.5-7b）。Ollama 返回的格式跟远程保持一致——sub_tasks + slot_ops + emotion。这个降级对下游 Orchestrator 是透明的，感知不到切换。如果 Ollama 也失败了，才返回安全默认值（sub_tasks=["CHITCHAT"], emotion="NEUTRAL"）。
 >
-> **第二层：Agent 执行降级。** Agent 调用远程 API 失败时，同样切到 Ollama 生成回复。如果一个 Agent 类型（比如 EscalationAgent）彻底挂了，还有第三道防线——`_execute()` 里的 Agent 级别降级，自动降级到 ConsultAgent 处理，而不是直接给用户报错。
+> **第二层：Response Agent（生成层）降级。** Response Agent 调用远程 API 失败时同样切到 Ollama 生成回复。如果 Ollama 也挂了，返回兜底话术："抱歉，我暂时无法回答您的问题，请稍后重试。"
 >
-> **Ollama 部署在 docker-compose 里，跟主服务同机。** 模型用的是 qwen2.5-7b-Q4_K_M 量化版，显存占用大概 6GB，响应延迟 2-3 秒。这个模型在通用对话和意图识别上的能力足够做降级兜底，不会出现答非所问的情况。切换到 Ollama 时会在日志里标记，方便监控和告警。
->
-> **一句话总结：远程 API 正常时 Ollama 闲置待命；远程挂了自动切 Ollama，挂了也不中断对话；两个都挂了才返回兜底话术。**
+> **Ollama 部署在 docker-compose 里，跟主服务同机。** 模型用的是 qwen2.5-7b-Q4_K_M 量化版，显存占用大概 6GB，响应延迟 2-3 秒。这个模型在通用对话上的能力足够做降级兜底。
 
 ---
 

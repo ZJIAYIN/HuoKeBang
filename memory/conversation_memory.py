@@ -87,14 +87,11 @@ class MemoryManager:
         chroma_host:  str = "localhost",
         chroma_port:  int = 8000,
         chroma_path:  str = "./data/chroma",
-        api_key:      str = "",
-        base_url:     Optional[str] = None,
-        model:        str = "claude-3-5-sonnet-20241022",
+        api_key:      str = "sk-92f09f3ada494ecd8390763ff293906b",
+        base_url:     Optional[str] = "https://api.deepseek.com/anthropic",
+        model:        str = "deepseek-chat",
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = AsyncAnthropic(api_key=api_key, base_url=base_url)
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
