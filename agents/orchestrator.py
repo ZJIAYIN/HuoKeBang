@@ -62,6 +62,7 @@ class ResponseInput:
     user_message:  str                  # 用户原始输入
     user_profile:  str = ""             # 用户画像（来自 MemoryManager）
     history:       str = ""             # 对话历史
+    weather_data:  Optional[Dict[str, Any]] = None  # 天气查询结果（来自 Tool.WEATHER）
 
 
 @dataclass
@@ -169,6 +170,7 @@ class Orchestrator:
             user_message="",
             user_profile=memory_context,
             history="",
+            weather_data=tool_results.get("weather"),
         )
 
 
@@ -261,6 +263,33 @@ class ResponseAgent:
         # 用户画像 / 历史（来自 MemoryManager）
         if input_data.user_profile:
             msg_parts.append(f"\n【背景】\n{input_data.user_profile}")
+
+        # 天气信息（来自 Tool.WEATHER）
+        if input_data.weather_data:
+            w = input_data.weather_data
+            loc = w.get("location", "")
+            curr = w.get("current", {})
+
+            weather_lines = [f"📍 {loc}"]
+            if curr:
+                weather_lines.append(
+                    f"🌡 当前 {curr.get('temp', '?')}°C（体感 {curr.get('feels_like', '?')}°C）"
+                    f"  {curr.get('condition', '')}"
+                    f"  湿度 {curr.get('humidity', '?')}%"
+                    f"  风向 {curr.get('wind_dir', '?')} {curr.get('wind_speed', '?')}km/h"
+                )
+
+            forecast = w.get("forecast", [])
+            if forecast:
+                weather_lines.append("\n📅 未来预报：")
+                for day in forecast:
+                    weather_lines.append(
+                        f"  {day.get('date', '')}: "
+                        f"{day.get('min_temp', '?')}~{day.get('max_temp', '?')}°C "
+                        f"🌅 {day.get('sunrise', '?')} 🌇 {day.get('sunset', '?')}"
+                    )
+
+            msg_parts.append(f"\n【天气信息】\n" + "\n".join(weather_lines))
 
         user_content = "\n".join(msg_parts)
 

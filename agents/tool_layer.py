@@ -2,17 +2,22 @@
 Tool Layer — Orchestrator 统一调度的工具层
 
 职责：
-  - 提供统一的工具接口（当前仅有 RAG，预留 CRM / Calculator 等）
+  - 提供统一的工具接口（当前有 RAG + Weather，预留 CRM / Calculator 等）
   - RAG 执行链路：Query Rewrite → Hybrid Search → RRF → TopK
+  - Weather 执行链路：调用 wttr.in 第三方天气 API
   - 由 Orchestrator 集中触发，多个 Skill 共享结果
 
 设计原则：
-  - RAG 只执行一次，无论多少个 Skill 需要它
+  - 同一 Tool 只执行一次，无论多少个 Skill 需要它
   - Query Rewrite 利用 Planner 的 sub_tasks + slots 构造高质量检索 query
   - 不重复传入 MemoryManager 上下文（Planner 阶段已消费完毕）
 """
+import json
 import logging
+import urllib.parse
 from typing import Any, Dict, List, Optional
+
+import httpx
 
 from agents.skills.base import Tool
 from mcp.knowledge_base import KnowledgeBase
@@ -63,6 +68,9 @@ class ToolLayer:
         if Tool.RAG in required_tools:
             results["rag"] = await self.exec_rag(user_query, sub_tasks, slots, top_k)
 
+        if Tool.WEATHER in required_tools:
+            results["weather"] = await self.exec_weather(slots)
+
         # 预留：if Tool.CRM in required_tools: ...
         # 预留：if Tool.CALCULATOR in required_tools: ...
 
@@ -91,6 +99,101 @@ class ToolLayer:
         except Exception as ex:
             logger.error(f"RAG 检索失败: {ex}")
             return []
+
+    # ── Weather ─────────────────────────────────────────────────────────────
+
+    _WEATHER_API = "https://wttr.in/{location}?format=j1"
+
+    async def exec_weather(self, slots: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        执行天气查询，调用 wttr.in 第三方 API（免费，无需 API Key）。
+
+        从 slots 中读取 location，自动 URL 编码（支持中文地名），
+        返回结构化天气数据供 Response Agent 使用。
+
+        Args:
+            slots: 当前会话槽位，需包含 location 字段
+
+        Returns:
+            格式化的天气 dict，包含地点、当前天气和预报；
+            API 失败时返回 None。
+        """
+        location = slots.get("location", "")
+        if not location:
+            logger.warning("天气查询缺少 location 槽位")
+            return None
+
+        url = self._WEATHER_API.format(location=urllib.parse.quote(location))
+        logger.debug(f"天气查询: location={location}")
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as ex:
+            logger.error(f"天气 API 调用失败: {ex}")
+            return None
+
+        return self._parse_weather(data, location)
+
+    @staticmethod
+    def _parse_weather(data: Dict[str, Any], raw_location: str) -> Dict[str, Any]:
+        """
+        解析 wttr.in 的 JSON 响应，提取关键天气信息。
+
+        Args:
+            data: wttr.in 返回的原始 JSON
+            raw_location: 用户输入的地名（兜底用）
+
+        Returns:
+            提取后的天气 dict，包含 location / current / forecast 三个字段。
+        """
+        result: Dict[str, Any] = {}
+
+        # 地点名（取 API 返回的标准化名称，兜底用用户输入）
+        try:
+            area = data.get("nearest_area", [{}])[0]
+            result["location"] = area.get("areaName", [{}])[0].get("value", raw_location)
+        except (IndexError, KeyError, TypeError):
+            result["location"] = raw_location
+
+        # 当前天气
+        try:
+            cc = data.get("current_condition", [{}])[0]
+            desc_list = cc.get("weatherDesc", [])
+            result["current"] = {
+                "temp": cc.get("temp_C", ""),
+                "feels_like": cc.get("FeelsLikeC", ""),
+                "condition": desc_list[0].get("value", "") if desc_list else "",
+                "humidity": cc.get("humidity", ""),
+                "wind_dir": cc.get("winddir16Point", ""),
+                "wind_speed": cc.get("windspeedKmph", ""),
+                "cloudcover": cc.get("cloudcover", ""),
+                "pressure": cc.get("pressure", ""),
+                "uv_index": cc.get("uvIndex", ""),
+            }
+        except (IndexError, KeyError, TypeError):
+            result["current"] = {}
+
+        # 未来 3 天预报
+        forecasts = []
+        try:
+            for day in data.get("weather", []):
+                astro = day.get("astronomy", [{}])[0]
+                forecasts.append({
+                    "date": day.get("date", ""),
+                    "max_temp": day.get("maxtempC", ""),
+                    "min_temp": day.get("mintempC", ""),
+                    "avg_temp": day.get("avgtempC", ""),
+                    "sunrise": astro.get("sunrise", ""),
+                    "sunset": astro.get("sunset", ""),
+                })
+        except (IndexError, KeyError, TypeError):
+            pass
+        result["forecast"] = forecasts
+
+        return result
 
     # ── Query Rewrite ────────────────────────────────────────────────────
 

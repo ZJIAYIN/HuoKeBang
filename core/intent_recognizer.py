@@ -22,6 +22,7 @@ Planner — 理解层（LLM）
 import asyncio
 import hashlib
 import json
+
 import logging
 import re
 import time
@@ -141,6 +142,8 @@ _FEWSHOT = [
     (IntentCategory.CONTACT_GIVE, ["LEAD_CAPTURE"],         "positive",  "我的微信号是abc123", [{"op":"SET","slot":"wechat","value":"abc123"}]),
     (IntentCategory.CONTACT_NO,  ["CONTACT_NO"],            "neutral",   "不方便留电话", [{"op":"SET","slot":"lead_refused","value":True}]),
     (IntentCategory.CHITCHAT,    ["GREETING"],              "positive",  "今天天气不错", []),
+    (IntentCategory.CHITCHAT,    ["WEATHER"],               "neutral",   "北京今天天气怎么样？", [{"op":"SET","slot":"location","value":"北京"}]),
+    (IntentCategory.CHITCHAT,    ["WEATHER"],               "neutral",   "明天上海会下雨吗？", [{"op":"SET","slot":"location","value":"上海"}]),
     (IntentCategory.CHITCHAT,    ["GREETING"],              "neutral",   "你是机器人吗？", []),
 ]
 
@@ -154,7 +157,7 @@ _INTENT_TO_SUBTASKS: Dict[IntentCategory, List[str]] = {
     IntentCategory.CONTACT_GIVE:  ["LEAD_CAPTURE"],
     IntentCategory.CONTACT_NO:    ["CONTACT_NO"],
     IntentCategory.CONTACT_FIX:   ["CONTACT_FIX"],
-    IntentCategory.CHITCHAT:      ["GREETING"],
+    IntentCategory.CHITCHAT:      ["GREETING", "WEATHER"],
 }
 
 
@@ -268,10 +271,12 @@ class Planner:
   - COMPLAINT       投诉/不满
   - LEAD_CAPTURE    留资/联系方式
   - CONTACT_NO      拒绝留资
+  - WEATHER         查询天气
 - emotion 取值: {", ".join(s.value for s in Sentiment)}
 - slot_ops 用 SET 设置提取到的字段，DELETE 删除用户明确取消的字段
 - 常见槽位: model(车型), budget(预算), phone(手机号), wechat(微信号),
             issue(投诉事由), product(产品名), name(姓名),
+            location(地点/城市),
             lead_refused(拒绝留资)
 - lead_refused 在用户明确说不留电话/不需要时 SET 为 true
 - slot 值是用户消息中明确提到的，不要猜、不要编

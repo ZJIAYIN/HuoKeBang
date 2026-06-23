@@ -23,6 +23,7 @@ class Tool(Enum):
     RAG = "rag"          # 知识库检索
     CRM = "crm"          # 客户关系管理（预留）
     CALCULATOR = "calc"  # 金融计算器（预留）
+    WEATHER = "weather"  # 天气查询（调用第三方 API）
 
 
 class BaseSkill:
