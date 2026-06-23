@@ -275,7 +275,7 @@ class Planner:
 - emotion 取值: {", ".join(s.value for s in Sentiment)}
 - slot_ops 用 SET 设置提取到的字段，DELETE 删除用户明确取消的字段
 - 常见槽位: model(车型), budget(预算), phone(手机号), wechat(微信号),
-            issue(投诉事由), product(产品名), name(姓名),
+            issue(投诉事由),name(姓名),
             location(地点/城市),
             lead_refused(拒绝留资)
 - lead_refused 在用户明确说不留电话/不需要时 SET 为 true

@@ -340,15 +340,20 @@ class AgentEngine:
 
         from agents.slot_manager import SlotManager
 
+        self.model = "deepseek-chat"
         self.planner = Planner(
             api_key="sk-92f09f3ada494ecd8390763ff293906b",
             base_url="https://api.deepseek.com/anthropic",
-            model="deepseek-chat",
+            model=self.model,
         )
-        self.tool_layer = ToolLayer(knowledge_base) if knowledge_base else None
+        self.tool_layer = ToolLayer(
+            knowledge_base=knowledge_base,
+            api_key="sk-92f09f3ada494ecd8390763ff293906b",
+            base_url="https://api.deepseek.com/anthropic",
+            model=self.model,
+        ) if knowledge_base else None
         self.orchestrator = Orchestrator(tool_layer=self.tool_layer)
-        self.response_agent = ResponseAgent(client, "deepseek-chat")
-        self.model = "deepseek-chat"
+        self.response_agent = ResponseAgent(client, self.model)
         self.lead_store = LeadStore(redis_url)
 
         # SlotManager 使用 Redis 后端（跨会话持久化）

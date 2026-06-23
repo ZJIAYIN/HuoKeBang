@@ -1,7 +1,7 @@
 """
-EchoMind 智能客服系统 — FastAPI 入口
+EchoMind 智能客服系统 — FastAPI 入口（新架构 v2）
 
-在 lifespan 中初始化所有核心组件：AgentEngine（新架构）、MemoryManager、KnowledgeBase 等。
+在 lifespan 中初始化所有核心组件：AgentEngine、MemoryManager、KnowledgeBase 等。
 """
 import asyncio
 import json
@@ -46,75 +46,35 @@ BANNER = r"""
 # ── 全局组件（lifespan 中初始化）─────────────────────────────────────────────
 _engine     = None  # AgentEngine（新架构）
 _memory     = None
-_tool_manager = None
-_monitor    = None
-_evaluator  = None
 _kb         = None
 
 
 API_KEY = "sk-92f09f3ada494ecd8390763ff293906b"
 BASE_URL = "https://api.deepseek.com/anthropic"
 MODEL = "deepseek-chat"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine, _memory, _tool_manager, _monitor, _evaluator, _kb
+    global _engine, _memory, _kb
 
     print(BANNER, flush=True)
 
     from agents.orchestrator import AgentEngine
-    from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
-    from monitor.performance_monitor import PerformanceMonitor
-    # IntentRecognizer 仅用于 evaluator（Planner 的向后兼容包装）
-    from core.intent_recognizer import IntentRecognizer
 
     logger.info(f"模型: {MODEL}  base_url: {BASE_URL}")
 
-    # ── 知识库（先初始化，后面要注入到引擎）─────────────────────────────
+    # ── 知识库 ──────────────────────────────────────────────────────────
     _kb = KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
+        embedding_model=EMBEDDING_MODEL,
     )
-    logger.info(f"知识库已加载: {_kb.doc_count} 个文档片段")
-
-    # ── MCP 工具管理器 ────────────────────────────────────────────────
-    _tool_manager = MCPToolManager(
-        api_key=API_KEY,
-        base_url=BASE_URL,
-        model=MODEL,
-    )
-
-    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
-
-    _tool_manager.register(Tool(
-        name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
-        handler=_kb.search_handler,
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
-        cache_ttl=300.0,
-        supports_rerank=True,
-        fallback=knowledge_fallback,
-    ))
+    logger.info(f"知识库已加载: {_kb.doc_count} 个文档片段（嵌入模型: {EMBEDDING_MODEL}）")
 
     # ── 新架构引擎 ────────────────────────────────────────────────────
     _engine = AgentEngine(
@@ -133,41 +93,9 @@ async def lifespan(app: FastAPI):
         model=MODEL,
     )
 
-    # ── 监控 ─────────────────────────────────────────────────────────
-    prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
-    _monitor = PerformanceMonitor(
-        orchestrator=None,          # 新架构暂不接入监控，后续升级
-        tool_manager=_tool_manager,
-        interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
-        webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
-        prometheus_port=prom_port,
-    )
-    await _monitor.start()
-
-    # ── 评测器 ───────────────────────────────────────────────────────
-    # 使用旧 IntentRecognizer 做意图评测（向后兼容）
-    recognizer = IntentRecognizer(
-        api_key=API_KEY,
-        base_url=BASE_URL,
-        model=MODEL,
-    )
-    # 使用旧 AgentOrchestrator 做对话评测（向后兼容，Phase 4 迁移）
-    from agents.agent_orchestrator import AgentOrchestrator
-    _evaluator = EndToEndEvaluator(
-        orchestrator=AgentOrchestrator(
-            redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
-        ),
-        recognizer=recognizer,
-        api_key=API_KEY,
-        base_url=BASE_URL,
-        model=MODEL,
-        baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
-    )
-
     logger.info("EchoMind v2（新架构）已就绪")
     yield
 
-    await _monitor.stop()
     logger.info("EchoMind 已关闭")
 
 
@@ -306,28 +234,13 @@ def _append_intent_log(message: str, primary_intent: str,
 
 # ── 其余路由 ──────────────────────────────────────────────────────────────────
 
-@app.get("/monitor")
-async def monitor_summary():
-    if _monitor is None:
-        raise HTTPException(503, "服务未就绪")
-    return _monitor.summary()
-
-
 @app.get("/metrics")
 async def prometheus_metrics():
+    """Prometheus 指标端点。"""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post("/search")
-async def search(query: str, top_k: int = 5):
-    """MCP 工具演示：查询改写 → 并行召回 → 重排 → Top-K"""
-    if _tool_manager is None:
-        raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
-
-
-# ── 知识库路由（保持不变）───────────────────────────────────────────────────
+# ── 知识库路由 ───────────────────────────────────────────────────────────────
 
 class DocInput(BaseModel):
     title:   str
@@ -532,72 +445,6 @@ async def memory_episodic():
         raise HTTPException(503, "记忆系统未初始化")
     episodic = _memory.list_episodic()
     return {"total": len(episodic), "episodic": episodic}
-
-
-# ── 评测路由（使用旧架构，eval 主要测 intent 而非 RAG 链路）───────────────────
-
-class EvalIntentInput(BaseModel):
-    message: str
-    expected_intent: str
-    persona: Optional[str] = None
-    context: Optional[Dict[str, Any]] = None
-
-
-class EvalDialogInput(BaseModel):
-    question: Optional[str] = None
-    turns: Optional[List[str]] = None
-    user_id: Optional[str] = None
-    conv_id: Optional[str] = None
-
-
-class EvalRunInput(BaseModel):
-    intent_cases: Optional[List[EvalIntentInput]] = None
-    dialog_cases: Optional[List[EvalDialogInput]] = None
-
-
-@app.post("/eval/run")
-async def run_eval(body: Optional[EvalRunInput] = None):
-    if _evaluator is None:
-        raise HTTPException(503, "服务未就绪")
-    from evaluation.evaluator import DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase
-
-    if body and body.intent_cases is not None:
-        intent_cases = [
-            IntentTestCase(
-                message=c.message,
-                expected_intent=c.expected_intent,
-                persona=c.persona or "",
-                context=c.context,
-            )
-            for c in body.intent_cases
-        ]
-    else:
-        intent_cases = DEFAULT_INTENT_CASES
-
-    if body and body.dialog_cases is not None:
-        dialog_cases = [c.model_dump(exclude_none=True) for c in body.dialog_cases]
-    else:
-        dialog_cases = DEFAULT_DIALOG_CASES
-
-    report = await _evaluator.run(intent_cases=intent_cases, dialog_cases=dialog_cases)
-    return {
-        "pass_rate":       report.pass_rate,
-        "total":           report.total,
-        "passed":          report.passed,
-        "avg_scores":      report.avg_scores,
-        "regressions":     report.regressions,
-        "recommendations": report.recommendations,
-        "results": [
-            {
-                "test_id": r.test_id,
-                "passed": r.passed,
-                "scores": r.scores,
-                "detail": r.detail,
-                "metadata": r.metadata,
-            }
-            for r in report.results
-        ],
-    }
 
 
 # ── Multi-Intent 评估路由 ─────────────────────────────────────────────────────
