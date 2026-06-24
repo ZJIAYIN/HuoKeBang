@@ -206,13 +206,53 @@ class ResponseAgent:
 
     async def generate(self, input_data: ResponseInput) -> str:
         """
-        生成回复。
+        生成回复（非流式）。
 
         输入：
             ResponseInput（Instruction + Context）
         输出：
             回复文本
         """
+        system_prompt, user_content = self._build_prompt(input_data)
+
+        try:
+            resp = await self._client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                temperature=0.3,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            return resp.content[0].text
+        except Exception as ex:
+            logger.error(f"Response Agent 生成失败: {ex}")
+            return "抱歉，我暂时无法回答您的问题，请稍后重试。"
+
+    async def generate_stream(self, input_data: ResponseInput):
+        """
+        生成回复（流式）。async generator，逐 token 产出。
+
+        先 yield 一次 full_response，然后是逐 token 流。
+        """
+        system_prompt, user_content = self._build_prompt(input_data)
+
+        try:
+            full_response = ""
+            async with self._client.messages.stream(
+                model=self._model,
+                max_tokens=1024,
+                temperature=0.3,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    full_response += text
+                    yield text
+        except Exception as ex:
+            logger.error(f"Response Agent 流式生成失败: {ex}")
+            yield "\n[抱歉，生成回复时出错，请稍后重试]"
+
+    def _build_prompt(self, input_data: ResponseInput):
         # 构建 System Prompt
         system_parts = []
 
@@ -295,18 +335,7 @@ class ResponseAgent:
 
         user_content = "\n".join(msg_parts)
 
-        try:
-            resp = await self._client.messages.create(
-                model=self._model,
-                max_tokens=1024,
-                temperature=0.3,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}],
-            )
-            return resp.content[0].text
-        except Exception as ex:
-            logger.error(f"Response Agent 生成失败: {ex}")
-            return "抱歉，我暂时无法回答您的问题，请稍后重试。"
+        return system_prompt, user_content
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -440,3 +469,86 @@ class AgentEngine:
             need_rag=bool(response_input.knowledge),
             latency_ms=total_ms,
         )
+
+    async def run_stream(
+        self,
+        message: str,
+        conv_id: str = "",
+        user_id: str = "",
+        memory_context: str = "",
+        history: Optional[List[Dict[str, str]]] = None,
+    ):
+        """
+        流式版 run() — async generator，先 yield meta 字典，然后逐 token yield 文本。
+        最后 yield 一次 {"done": True, ...} 携带完整结果。
+        """
+        t0 = time.monotonic()
+        slot_manager = self._get_slot_manager(user_id, conv_id)
+
+        if user_id and self.lead_store.is_in_cooldown(user_id):
+            slot_manager.set("lead_refused", True)
+
+        # 1. Planner
+        planner_output = await self.planner.plan(
+            message=message,
+            history=history,
+            existing_slots=slot_manager.all,
+        )
+
+        # 2. Orchestrator
+        response_input = await self.orchestrator.orchestrate(
+            planner_output=planner_output,
+            slot_manager=slot_manager,
+            memory_context=memory_context,
+        )
+        response_input.user_message = message
+
+        # 2.5 留资持久化
+        if user_id:
+            slots = slot_manager.all
+            if slots.get("phone") or slots.get("wechat"):
+                self.lead_store.save_lead_from_slots(user_id, slots)
+            if "CONTACT_NO" in response_input.completed:
+                self.lead_store.record_refusal(user_id)
+
+        # 先 yield meta（前端需要知道 intent/emotion/skills 用于显示标签）
+        meta = {
+            "type": "meta",
+            "primary_intent": planner_output.primary_intent,
+            "sub_tasks": planner_output.sub_tasks,
+            "emotion": planner_output.emotion,
+            "skill_statuses": [
+                {"name": s.name, "status": s.status, "reason": s.reason}
+                for s in [
+                    SkillStatus(name=s, status="completed")
+                    for s in response_input.completed
+                ] + [
+                    SkillStatus(name=p.get("skill", ""), status="pending",
+                                reason=str(p.get("missing", p.get("reason", ""))))
+                    for p in response_input.pending
+                ]
+            ],
+            "need_rag": bool(response_input.knowledge),
+        }
+        yield meta
+
+        # 3. Response Agent 流式生成
+        full_response = ""
+        async for token in self.response_agent.generate_stream(response_input):
+            full_response += token
+            yield {"type": "token", "text": token}
+
+        total_ms = (time.monotonic() - t0) * 1000
+
+        # 最后 yield 完成信号
+        yield {
+            "type": "done",
+            "conv_id": conv_id,
+            "response": full_response,
+            "primary_intent": planner_output.primary_intent,
+            "sub_tasks": planner_output.sub_tasks,
+            "emotion": planner_output.emotion,
+            "skill_statuses": meta["skill_statuses"],
+            "knowledge_used": bool(response_input.knowledge),
+            "latency_ms": round(total_ms, 1),
+        }

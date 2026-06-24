@@ -282,7 +282,7 @@ class Planner:
             "- 多个意图时，primary_intent 选最核心的那个，其他放 sub_tasks",
             "- 用户报预算但没说要买 → sub_tasks 包含 PRICE、不一定要 PURCHASE",
             '- "滚滚滚"/"骗子"是 negative；"你确定吗"只是 skeptical',
-            "- 纯数字手机号 → 提取 phone 字段",
+            "- 手机号必须是 11 位纯数字且以 1 开头才提取 phone 字段，不足 11 位的纯数字不是手机号",
             '- 用户说"算了不要了" → slot_ops 删除相关字段（如 DELETE budget）',
             "",
             "=== 安全约束 ===",

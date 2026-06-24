@@ -4,6 +4,7 @@ EchoMind 智能客服系统 — FastAPI 入口（新架构 v2）
 在 lifespan 中初始化所有核心组件：AgentEngine、MemoryManager、KnowledgeBase 等。
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,8 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
+import redis as _redis_module
+
 # 将项目根目录加入 sys.path
 _ROOT = str(pathlib.Path(__file__).parent.parent.resolve())
 if _ROOT not in sys.path:
@@ -23,6 +26,8 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
@@ -49,6 +54,10 @@ _memory     = None
 _kb         = None
 _detector   = None  # Prompt Injection 检测器
 
+# 上传去重（Redis Set + MD5）
+_redis_dedup  = None
+_UPLOAD_DEDUP_KEY = "echomind:upload_doc_ids"
+
 
 API_KEY = "sk-92f09f3ada494ecd8390763ff293906b"
 BASE_URL = "https://api.deepseek.com/anthropic"
@@ -58,7 +67,7 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine, _memory, _kb, _detector
+    global _engine, _memory, _kb, _detector, _redis_dedup
 
     print(BANNER, flush=True)
 
@@ -67,6 +76,14 @@ async def lifespan(app: FastAPI):
     from memory.conversation_memory import MemoryManager
 
     logger.info(f"模型: {MODEL}  base_url: {BASE_URL}")
+
+    # ── 上传去重 Redis Set ─────────────────────────────────────────────
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    try:
+        _redis_dedup = _redis_module.from_url(redis_url, decode_responses=True)
+        logger.info("上传去重 Redis 已连接")
+    except Exception:
+        logger.warning("Redis 不可用，上传去重降级为 ChromaDB 查询")
 
     # ── 知识库 ──────────────────────────────────────────────────────────
     _kb = KnowledgeBase(
@@ -118,6 +135,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── 静态文件（前端 SPA）────────────────────────────────────────────────────────
+_STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_index():
+        return FileResponse(str(_STATIC_DIR / "index.html"))
 
 
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
@@ -227,6 +254,92 @@ async def chat(req: ChatRequest):
     )
 
 
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    流式对话接口（SSE）。
+
+    流格式：
+      data: {"type":"meta","primary_intent":"...","emotion":"...",...}
+      data: {"type":"token","text":"逐 token 内容"}
+      data: {"type":"done","response":"完整回复",...}
+    """
+    if _engine is None or _memory is None:
+        raise HTTPException(503, "服务未就绪")
+
+    # ── 注入检测 ────────────────────────────────────────────
+    if _detector and _detector.check(req.message):
+        async def reject_gen():
+            yield json.dumps({
+                "type": "meta",
+                "primary_intent": "chitchat",
+                "sub_tasks": ["GREETING"],
+                "emotion": "neutral",
+                "skill_statuses": [],
+                "need_rag": False,
+            }) + "\n"
+            yield json.dumps({
+                "type": "done",
+                "response": "抱歉，您的输入包含异常内容，请重新描述您的问题。",
+                "primary_intent": "chitchat",
+                "sub_tasks": ["GREETING"],
+                "emotion": "neutral",
+                "skill_statuses": [],
+                "knowledge_used": False,
+                "latency_ms": 0,
+            }) + "\n"
+        return StreamingResponse(reject_gen(), media_type="text/event-stream")
+
+    from memory.conversation_memory import MsgRole
+
+    conv_id = req.conv_id or str(uuid.uuid4())
+    user_id = req.user_id or "anonymous"
+
+    # 1. 读取记忆上下文
+    mem_ctx = await _memory.get_context(user_id, conv_id, query=req.message)
+
+    # 2. 构建对话历史
+    history = [
+        {"role": m.role.value, "content": m.content}
+        for m in mem_ctx.recent_messages[-5:]
+    ] if mem_ctx.recent_messages else None
+
+    async def event_generator():
+        """SSE 事件流。"""
+        full_response = ""
+        async for event in _engine.run_stream(
+            message=req.message.strip(),
+            conv_id=conv_id,
+            user_id=user_id,
+            memory_context=mem_ctx.to_prompt_text(),
+            history=history,
+        ):
+            if event["type"] == "meta":
+                # 先写 intent 日志（只写一次，在 meta 阶段）
+                _append_intent_log(
+                    message=req.message,
+                    primary_intent=event.get("primary_intent", ""),
+                    sub_tasks=event.get("sub_tasks", []),
+                    emotion=event.get("emotion", ""),
+                    user_id=user_id,
+                    history=history,
+                )
+                yield f"data: {json.dumps(event)}\n\n"
+
+            elif event["type"] == "token":
+                full_response += event["text"]
+                yield f"data: {json.dumps(event)}\n\n"
+
+            elif event["type"] == "done":
+                # 写入记忆
+                await _memory.add_message(user_id, conv_id, MsgRole.USER, req.message)
+                await _memory.add_message(user_id, conv_id, MsgRole.ASSISTANT, full_response)
+                asyncio.create_task(_memory.update_profile(user_id, conv_id))
+                yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 def _append_intent_log(message: str, primary_intent: str,
                        sub_tasks: List[str], emotion: str,
                        user_id: str,
@@ -299,6 +412,14 @@ async def upload_knowledge(file: UploadFile = File(...)):
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     title = filename.rsplit(".", 1)[0] if "." in filename else filename
 
+    # ── Redis 快速去重：基于原始文件内容，跳过解析 ───────────────────────
+    raw_doc_id = hashlib.md5(f"{filename}|{len(content)}|{content[:500]}".encode()).hexdigest()
+    if _redis_dedup and _redis_dedup.sismember(_UPLOAD_DEDUP_KEY, raw_doc_id):
+        return {
+            "message": f"文件 {filename} 已存在，跳过导入",
+            "added_chunks": 0, "skipped": 1, "doc_ids": [], "total_chunks": _kb.doc_count, "source_docs": 0, "dedup": "redis",
+        }
+
     if ext == "pdf":
         docs = _parse_pdf(content, title)
     elif ext == "docx":
@@ -310,42 +431,64 @@ async def upload_knowledge(file: UploadFile = File(...)):
         docs = [{"title": title, "content": text}]
 
     result = _kb.add_documents(docs)
-    message = f"文件 {filename} 导入成功，新增 {result['added_chunks']} 个片段"
-    if result.get("skipped"):
-        message += f"，跳过 {result['skipped']} 篇重复"
+    added = result.get("added_chunks", 0)
+    skipped = result.get("skipped", 0)
+
+    # 导入成功 → 记录到 Redis Set
+    if added > 0 and _redis_dedup:
+        _redis_dedup.sadd(_UPLOAD_DEDUP_KEY, raw_doc_id)
+
+    message = f"文件 {filename}"
+    if added > 0:
+        message += f" 导入成功，新增 {added} 个片段"
+    if skipped > 0:
+        message += f"（跳过 {skipped} 篇重复）"
+    if added == 0 and skipped == 0:
+        message += " 无可导入内容"
+
     return {
         "message": message,
-        "added_chunks": result["added_chunks"],
-        "skipped": result.get("skipped", 0),
-        "doc_ids": result["doc_ids"],
+        "added_chunks": added,
+        "skipped": skipped,
+        "doc_ids": result.get("doc_ids", []),
         "total_chunks": _kb.doc_count,
         "source_docs": len(docs),
+        "dedup": False,
     }
 
 
 def _parse_pdf(raw: bytes, title: str) -> List[Dict[str, str]]:
+    """
+    解析 PDF，所有页合并为一篇文档（单个 doc_id）。
+
+    每页的文本和表格按页面顺序拼接，保持可读性。
+    _chunk() 会自动在 500 字符处切割，所以合并不影响后续处理。
+    """
     import io
     import pdfplumber
 
-    docs: List[Dict[str, str]] = []
+    all_parts: List[str] = []
     with pdfplumber.open(io.BytesIO(raw)) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
-            parts: List[str] = []
+            page_parts: List[str] = []
             text = page.extract_text()
             if text and text.strip():
-                parts.append(text.strip())
+                page_parts.append(text.strip())
             tables = page.extract_tables()
             if tables:
                 for t in tables:
                     md = _table_to_markdown(t)
                     if md:
-                        parts.append(md)
-            if parts:
-                doc_title = f"{title}_p{i}" if len(pdf.pages) > 1 else title
-                docs.append({"title": doc_title, "content": "\n\n".join(parts)})
-    if not docs:
+                        page_parts.append(md)
+            if page_parts:
+                page_header = f"--- 第 {i} 页 ---"
+                all_parts.append(page_header + "\n" + "\n\n".join(page_parts))
+
+    if not all_parts:
         raise HTTPException(400, "PDF 文件中未提取到文本内容")
-    return docs
+
+    # 整份 PDF 就是一篇文档 → 一个 doc_id
+    return [{"title": title, "content": "\n\n".join(all_parts)}]
 
 
 def _parse_docx(raw: bytes, title: str) -> List[Dict[str, str]]:
@@ -431,6 +574,15 @@ async def knowledge_list():
     return {"total": len(_kb.list_chunks()), "chunks": _kb.list_chunks()}
 
 
+@app.get("/knowledge/documents", tags=["知识库"])
+async def knowledge_documents():
+    """按文档（doc_id）分组返回，每条含所有 chunk 预览。"""
+    if _kb is None:
+        raise HTTPException(503, "知识库未初始化")
+    docs = _kb.list_documents()
+    return {"total": len(docs), "documents": docs}
+
+
 @app.delete("/knowledge/{doc_id}", tags=["知识库"])
 async def knowledge_delete(doc_id: str):
     if _kb is None:
@@ -438,6 +590,9 @@ async def knowledge_delete(doc_id: str):
     deleted = _kb.delete_by_doc_id(doc_id)
     if deleted == 0:
         raise HTTPException(404, f"文档 {doc_id} 不存在或已被删除")
+    # 清除去重缓存（允许重新上传同一文件）
+    if _redis_dedup:
+        _redis_dedup.delete(_UPLOAD_DEDUP_KEY)
     return {"message": f"文档 {doc_id} 已删除", "deleted_chunks": deleted, "total_chunks": _kb.doc_count}
 
 
@@ -446,6 +601,8 @@ async def knowledge_clear():
     if _kb is None:
         raise HTTPException(503, "知识库未初始化")
     deleted = _kb.clear()
+    if _redis_dedup:
+        _redis_dedup.delete(_UPLOAD_DEDUP_KEY)
     return {"message": "知识库已清空", "deleted_chunks": deleted, "total_chunks": _kb.doc_count}
 
 

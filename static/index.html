@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EchoMind — 智能客服 AI 系统</title>
+  <meta name="description" content="EchoMind 智能客服 AI 系统 — 知识库驱动，多技能编排" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg viewBox='0 0 24 24' fill='none' stroke='%238b5cf6' stroke-width='1.5' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div class="app-root">
+      <!-- Header -->
+      <header class="header">
+        <div class="header-brand">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+          </svg>
+          <span>EchoMind</span>
+        </div>
+        <nav class="header-tabs">
+          <button v-for="t in tabs" :key="t.id"
+            :class="['tab-btn', { active: activeTab === t.id }]"
+            @click="activeTab = t.id">
+            <span v-html="t.icon"></span>
+            <span>{{ t.label }}</span>
+          </button>
+        </nav>
+      </header>
+
+      <!-- Main Content -->
+      <main class="main">
+        <div v-show="activeTab === 'chat'" class="tab-content" :class="{ active: activeTab === 'chat' }">
+          <chat-view></chat-view>
+        </div>
+        <div v-show="activeTab === 'knowledge'" class="tab-content" :class="{ active: activeTab === 'knowledge' }">
+          <knowledge-view></knowledge-view>
+        </div>
+        <div v-show="activeTab === 'memory'" class="tab-content" :class="{ active: activeTab === 'memory' }">
+          <memory-view></memory-view>
+        </div>
+      </main>
+
+      <!-- Toasts -->
+      <div class="toast-container">
+        <div v-for="t in toasts" :key="t.id" :class="['toast', t.type]">
+          <span v-html="toastIcons[t.type] || toastIcons.info"></span>
+          <span>{{ t.message }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Vue 3 CDN -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+  <!-- Components -->
+  <script src="/static/js/chat.js"></script>
+  <script src="/static/js/knowledge.js"></script>
+  <script src="/static/js/memory.js"></script>
+  <!-- App -->
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

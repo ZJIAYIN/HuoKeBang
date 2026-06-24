@@ -310,14 +310,29 @@ class KnowledgeBase:
         except (ValueError, chromadb.errors.NotFoundError):
             pass  # 集合不存在，首次创建
 
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            embedding_function=self._embedder,
-            metadata={
-                "description": "EchoMind RAG 知识库（混合检索：向量 + BM25 → RRF）",
-                "embedding_model": embedding_model,
-            },
-        )
+        try:
+            self._collection = self._client.get_or_create_collection(
+                name=self.COLLECTION_NAME,
+                embedding_function=self._embedder,
+                metadata={
+                    "description": "EchoMind RAG 知识库（混合检索：向量 + BM25 → RRF）",
+                    "embedding_model": embedding_model,
+                },
+            )
+        except ValueError as _e:
+            if "Embedding function conflict" in str(_e):
+                logger.warning("嵌入函数冲突，删除旧集合重建")
+                self._client.delete_collection(self.COLLECTION_NAME)
+                self._collection = self._client.get_or_create_collection(
+                    name=self.COLLECTION_NAME,
+                    embedding_function=self._embedder,
+                    metadata={
+                        "description": "EchoMind RAG 知识库（混合检索：向量 + BM25 → RRF）",
+                        "embedding_model": embedding_model,
+                    },
+                )
+            else:
+                raise
 
         # BM25 关键词索引
         self._bm25 = BM25Index()
@@ -371,8 +386,8 @@ class KnowledgeBase:
         for doc in documents:
             title   = doc.get("title", "")
             content = doc.get("content", "")
-            # 全文 MD5 作为文档 ID，内容一致即可幂等
-            doc_id  = hashlib.md5(content.encode("utf-8")).hexdigest()
+            # "标题+内容" MD5 作为文档 ID — 标题不同就算不同文档，去重精确
+            doc_id  = hashlib.md5(f"{title}|{content}".encode("utf-8")).hexdigest()
             doc_ids.append(doc_id)
 
             # 去重：检查 doc_id 是否已存在
@@ -464,7 +479,7 @@ class KnowledgeBase:
 
     def clear(self) -> int:
         """
-        清空知识库所有文档。
+        清空知识库所有文档（只删内容，保留集合和嵌入函数）。
         同步清理 ChromaDB 和 BM25 索引。
 
         返回: 删除的 chunk 数量。
@@ -475,14 +490,9 @@ class KnowledgeBase:
 
         result = self._collection.get()
         if result["ids"]:
+            self._collection.delete(ids=result["ids"])
             for cid in result["ids"]:
                 self._bm25.remove(cid)
-
-        self._client.delete_collection(self.COLLECTION_NAME)
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 知识库（混合检索：向量 + BM25 → RRF）"},
-        )
 
         logger.info(f"知识库已清空: 删除 {total} 个片段")
         return total
@@ -491,7 +501,7 @@ class KnowledgeBase:
         """
         返回知识库中所有片段的完整列表。
 
-        每条包含：id, title, content（全文）, chunk_index, total_chunks。
+        每条包含：id, doc_id, title, content（全文）, chunk_index, total_chunks。
         """
         if self._collection.count() == 0:
             return []
@@ -503,12 +513,45 @@ class KnowledgeBase:
                 meta = result["metadatas"][i] if result["metadatas"] and i < len(result["metadatas"]) else {}
                 items.append({
                     "id":           result["ids"][i] if result["ids"] and i < len(result["ids"]) else "",
+                    "doc_id":       meta.get("doc_id", ""),
                     "title":        meta.get("title", ""),
                     "content":      result["documents"][i],
                     "chunk_index":  meta.get("chunk_index", 0),
                     "total_chunks": meta.get("total_chunks", 1),
                 })
         return items
+
+    def list_documents(self) -> List[Dict[str, Any]]:
+        """
+        按 doc_id 分组返回文档列表（含 chunk 预览）。
+
+        每条包含：doc_id, title, chunk_count, content_preview。
+        """
+        chunks = self.list_chunks()
+        groups: Dict[str, Dict[str, Any]] = {}
+        for c in chunks:
+            did = c.get("doc_id", "")
+            if not did:
+                continue
+            if did not in groups:
+                groups[did] = {
+                    "doc_id":   did,
+                    "title":    c.get("title", ""),
+                    "chunks":   [],
+                }
+            groups[did]["chunks"].append({
+                "id":           c["id"],
+                "chunk_index":  c["chunk_index"],
+                "total_chunks": c["total_chunks"],
+                "content":      c["content"],
+            })
+
+        result = []
+        for did, g in groups.items():
+            g["chunk_count"] = len(g["chunks"])
+            g["content_preview"] = (g["chunks"][0]["content"][:120] + "…") if g["chunks"] else ""
+            result.append(g)
+        return result
 
     # ── 检索 ──────────────────────────────────────────────────────────────────
 
