@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 import redis as _redis_module
 
+# from core.rate_limiter import RequestDedup  # TODO: 去重逻辑待重新设计后启用
+
 # 将项目根目录加入 sys.path
 _ROOT = str(pathlib.Path(__file__).parent.parent.resolve())
 if _ROOT not in sys.path:
@@ -53,6 +55,8 @@ _engine     = None  # AgentEngine（新架构）
 _memory     = None
 _kb         = None
 _detector   = None  # Prompt Injection 检测器
+_work_queue = None  # 请求队列 + 工作协程
+_rate_limiter = None  # 限流组件（包含令牌桶 + 用户频控 + 去重）
 
 # 上传去重（Redis Set + MD5）
 _redis_dedup  = None
@@ -62,12 +66,11 @@ _UPLOAD_DEDUP_KEY = "echomind:upload_doc_ids"
 API_KEY = "sk-92f09f3ada494ecd8390763ff293906b"
 BASE_URL = "https://api.deepseek.com/anthropic"
 MODEL = "deepseek-chat"
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine, _memory, _kb, _detector, _redis_dedup
+    global _engine, _memory, _kb, _detector, _redis_dedup, _rate_limiter, _work_queue
 
     print(BANNER, flush=True)
 
@@ -90,9 +93,8 @@ async def lifespan(app: FastAPI):
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-        embedding_model=EMBEDDING_MODEL,
     )
-    logger.info(f"知识库已加载: {_kb.doc_count} 个文档片段（嵌入模型: {EMBEDDING_MODEL}）")
+    logger.info(f"知识库已加载: {_kb.doc_count} 个文档片段")
 
     # ── 新架构引擎 ────────────────────────────────────────────────────
     _engine = AgentEngine(
@@ -113,7 +115,21 @@ async def lifespan(app: FastAPI):
 
     # ── 注入检测器（基于向量相似度的 Prompt Injection 检测） ──────────────
     from security.injection_detector import InjectionDetector
-    _detector = InjectionDetector(model_name=EMBEDDING_MODEL, threshold=0.85)
+    _detector = InjectionDetector(threshold=0.85)
+
+    # ── 限流组件（令牌桶 + 用户频控）───────────────────────────────────────
+    from core.rate_limiter import TokenBucket, UserRateLimiter
+    _redis_for_ratelimit = _redis_dedup  # 复用上传去重的 Redis 连接
+    _rate_limiter = dict(
+        token_bucket=TokenBucket(rate=20, capacity=10),
+        user_limiter=UserRateLimiter(_redis_for_ratelimit, limit=5, window=30),
+        # TODO: 去重逻辑待重新设计后启用
+        # dedup=RequestDedup(_redis_for_ratelimit, ttl=15),
+    )
+
+    # ── 请求队列 + 工作协程 ──────────────────────────────────────────────
+    from core.work_queue import LLMWorkQueue
+    _work_queue = LLMWorkQueue(engine=_engine, num_workers=4, max_size=50)
 
     logger.info("EchoMind v2（新架构）已就绪")
     yield
@@ -182,12 +198,45 @@ async def chat(req: ChatRequest):
     主对话接口（新架构 v2）。
 
     完整流程：
-      记忆读取 → AgentEngine（Planner → Orchestrator → Response Agent）→ 记忆写入
+      限流检查 → 注入检测 → 记忆读取 → AgentEngine（Planner → Orchestrator → Response Agent）→ 记忆写入
+
+    限流保护：
+      1. 全局令牌桶 —— 控制总入口 QPS
+      2. 用户频控 —— 同一用户 30s 内最多 5 条
+      3. 工作队列 —— 超过并发上限时返回 429
     """
     if _engine is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
-    # ── 0. Prompt Injection 检测（优先拦截，不进入后续流程） ────────────
+    rl = _rate_limiter
+
+    # ── 0a. 全局令牌桶 ────────────────────────────────────
+    if rl and not rl["token_bucket"].consume():
+        return ChatResponse(
+            conv_id=req.conv_id or str(uuid.uuid4()),
+            response="系统繁忙，请稍后再试。",
+            primary_intent="chitchat",
+            sub_tasks=["GREETING"],
+            emotion="neutral",
+            skill_statuses=[],
+            knowledge_used=False,
+            latency_ms=0.0,
+        )
+
+    # ── 0b. 用户频控 ──────────────────────────────────────
+    if rl and not rl["user_limiter"].is_allowed(req.user_id):
+        return ChatResponse(
+            conv_id=req.conv_id or str(uuid.uuid4()),
+            response="消息发送太频繁，请稍后再试。",
+            primary_intent="chitchat",
+            sub_tasks=["GREETING"],
+            emotion="neutral",
+            skill_statuses=[],
+            knowledge_used=False,
+            latency_ms=0.0,
+        )
+
+    # ── 0d. 注入检测 ──────────────────────────────────
     if _detector and _detector.check(req.message):
         return ChatResponse(
             conv_id=req.conv_id or str(uuid.uuid4()),
@@ -213,14 +262,24 @@ async def chat(req: ChatRequest):
         for m in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
 
-    # 3. AgentEngine 完整链路（理解 → 编排 → 生成）
-    result = await _engine.run(
-        message=req.message.strip(),
-        conv_id=conv_id,
-        user_id=req.user_id,
-        memory_context=mem_ctx.to_prompt_text(),
-        history=history,
-    )
+    # 3. 通过工作队列提交（控制并发）
+    if _work_queue:
+        result = await _work_queue.submit(
+            message=req.message.strip(),
+            conv_id=conv_id,
+            user_id=req.user_id,
+            memory_context=mem_ctx.to_prompt_text(),
+            history=history,
+        )
+    else:
+        # 工作队列不可用时直接调用（极端降级）
+        result = await _engine.run(
+            message=req.message.strip(),
+            conv_id=conv_id,
+            user_id=req.user_id,
+            memory_context=mem_ctx.to_prompt_text(),
+            history=history,
+        )
 
     # 4. 持久化意图识别结果（用于后续模型微调）
     _append_intent_log(
@@ -254,6 +313,43 @@ async def chat(req: ChatRequest):
     )
 
 
+def _stream_rejection(req: ChatRequest, message: str) -> StreamingResponse:
+    """构造流式拒绝响应（SSE 格式）。
+
+    用于限流、注入检测等前置拦截场景，保持与正常流式一致的接口格式。
+
+    Args:
+        req: 原始请求
+        message: 拒绝原因文本
+
+    Returns:
+        SSE StreamingResponse
+    """
+    async def reject_gen():
+        rejection = message
+        yield json.dumps({
+            "type": "meta",
+            "primary_intent": "chitchat",
+            "sub_tasks": ["GREETING"],
+            "emotion": "neutral",
+            "skill_statuses": [],
+            "need_rag": False,
+            "conv_id": req.conv_id or str(uuid.uuid4()),
+        }) + "\n"
+        yield json.dumps({
+            "type": "done",
+            "response": rejection,
+            "primary_intent": "chitchat",
+            "sub_tasks": ["GREETING"],
+            "emotion": "neutral",
+            "skill_statuses": [],
+            "knowledge_used": False,
+            "latency_ms": 0,
+            "conv_id": req.conv_id or str(uuid.uuid4()),
+        }) + "\n"
+    return StreamingResponse(reject_gen(), media_type="text/event-stream")
+
+
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     """
@@ -267,28 +363,21 @@ async def chat_stream(req: ChatRequest):
     if _engine is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
-    # ── 注入检测 ────────────────────────────────────────────
+    rl = _rate_limiter
+
+    # ── 0a. 全局令牌桶 ────────────────────────────────────
+    if rl and not rl["token_bucket"].consume():
+        rejection = "系统繁忙，请稍后再试。"
+        return _stream_rejection(req, rejection)
+
+    # ── 0b. 用户频控 ──────────────────────────────────────
+    if rl and not rl["user_limiter"].is_allowed(req.user_id):
+        rejection = "消息发送太频繁，请稍后再试。"
+        return _stream_rejection(req, rejection)
+
+    # ── 0d. 注入检测 ──────────────────────────────────────
     if _detector and _detector.check(req.message):
-        async def reject_gen():
-            yield json.dumps({
-                "type": "meta",
-                "primary_intent": "chitchat",
-                "sub_tasks": ["GREETING"],
-                "emotion": "neutral",
-                "skill_statuses": [],
-                "need_rag": False,
-            }) + "\n"
-            yield json.dumps({
-                "type": "done",
-                "response": "抱歉，您的输入包含异常内容，请重新描述您的问题。",
-                "primary_intent": "chitchat",
-                "sub_tasks": ["GREETING"],
-                "emotion": "neutral",
-                "skill_statuses": [],
-                "knowledge_used": False,
-                "latency_ms": 0,
-            }) + "\n"
-        return StreamingResponse(reject_gen(), media_type="text/event-stream")
+        return _stream_rejection(req, "抱歉，您的输入包含异常内容，请重新描述您的问题。")
 
     from memory.conversation_memory import MsgRole
 
@@ -307,35 +396,44 @@ async def chat_stream(req: ChatRequest):
     async def event_generator():
         """SSE 事件流。"""
         full_response = ""
-        async for event in _engine.run_stream(
+        kwargs = dict(
             message=req.message.strip(),
             conv_id=conv_id,
             user_id=user_id,
             memory_context=mem_ctx.to_prompt_text(),
             history=history,
-        ):
-            if event["type"] == "meta":
-                # 先写 intent 日志（只写一次，在 meta 阶段）
-                _append_intent_log(
-                    message=req.message,
-                    primary_intent=event.get("primary_intent", ""),
-                    sub_tasks=event.get("sub_tasks", []),
-                    emotion=event.get("emotion", ""),
-                    user_id=user_id,
-                    history=history,
-                )
-                yield f"data: {json.dumps(event)}\n\n"
+        )
 
-            elif event["type"] == "token":
-                full_response += event["text"]
-                yield f"data: {json.dumps(event)}\n\n"
+        try:
+            if _work_queue:
+                stream = _work_queue.submit_stream(**kwargs)
+            else:
+                stream = _engine.run_stream(**kwargs)
 
-            elif event["type"] == "done":
-                # 写入记忆
-                await _memory.add_message(user_id, conv_id, MsgRole.USER, req.message)
-                await _memory.add_message(user_id, conv_id, MsgRole.ASSISTANT, full_response)
-                asyncio.create_task(_memory.update_profile(user_id, conv_id))
-                yield f"data: {json.dumps(event)}\n\n"
+            async for event in stream:
+                if event["type"] == "meta":
+                    _append_intent_log(
+                        message=req.message,
+                        primary_intent=event.get("primary_intent", ""),
+                        sub_tasks=event.get("sub_tasks", []),
+                        emotion=event.get("emotion", ""),
+                        user_id=user_id,
+                        history=history,
+                    )
+                    yield f"data: {json.dumps(event)}\n\n"
+
+                elif event["type"] == "token":
+                    full_response += event["text"]
+                    yield f"data: {json.dumps(event)}\n\n"
+
+                elif event["type"] == "done":
+                    await _memory.add_message(user_id, conv_id, MsgRole.USER, req.message)
+                    await _memory.add_message(user_id, conv_id, MsgRole.ASSISTANT, full_response)
+                    asyncio.create_task(_memory.update_profile(user_id, conv_id))
+                    yield f"data: {json.dumps(event)}\n\n"
+
+        except Exception as ex:
+            logger.error(f"流式处理异常: {ex}")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -479,7 +577,7 @@ def _parse_pdf(raw: bytes, title: str) -> List[Dict[str, str]]:
                 for t in tables:
                     md = _table_to_markdown(t)
                     if md:
-                        page_parts.append(md)
+                        page_parts.append(f"[表格开始]\n{md}\n[表格结束]")
             if page_parts:
                 page_header = f"--- 第 {i} 页 ---"
                 all_parts.append(page_header + "\n" + "\n\n".join(page_parts))
@@ -513,7 +611,7 @@ def _parse_docx(raw: bytes, title: str) -> List[Dict[str, str]]:
                 rows.append([cell.text.strip() for cell in row.cells])
             md = _table_to_markdown(rows)
             if md:
-                parts.append(md)
+                parts.append(f"[表格开始]\n{md}\n[表格结束]")
     if not parts:
         raise HTTPException(400, "Word 文档中未提取到文本内容")
     content = "\n\n".join(parts)
@@ -604,6 +702,32 @@ async def knowledge_clear():
     if _redis_dedup:
         _redis_dedup.delete(_UPLOAD_DEDUP_KEY)
     return {"message": "知识库已清空", "deleted_chunks": deleted, "total_chunks": _kb.doc_count}
+
+
+@app.delete("/memory/profile", tags=["记忆"])
+async def memory_clear_profile(user_id: Optional[str] = None):
+    if _memory is None:
+        raise HTTPException(503, "记忆系统未初始化")
+    deleted = _memory.clear_profile(user_id)
+    tag = f"user={user_id}" if user_id else "全部"
+    return {"message": f"用户画像已清除 ({tag}) {deleted} 条", "deleted": deleted}
+
+
+@app.delete("/memory/episodic", tags=["记忆"])
+async def memory_clear_episodic(user_id: Optional[str] = None):
+    if _memory is None:
+        raise HTTPException(503, "记忆系统未初始化")
+    deleted = _memory.clear_episodic(user_id)
+    tag = f"user={user_id}" if user_id else "全部"
+    return {"message": f"情景记忆已清除 ({tag}) {deleted} 条", "deleted": deleted}
+
+
+@app.delete("/memory/working", tags=["记忆"])
+async def memory_clear_working(user_id: str, conv_id: str):
+    if _memory is None:
+        raise HTTPException(503, "记忆系统未初始化")
+    ok = _memory.clear_working_memory(user_id, conv_id)
+    return {"message": "工作记忆已清除" if ok else "清除失败", "success": ok}
 
 
 @app.get("/memory/profiles", tags=["记忆"])

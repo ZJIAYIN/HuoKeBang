@@ -156,7 +156,7 @@ _INTENT_TO_SUBTASKS: Dict[IntentCategory, List[str]] = {
     IntentCategory.COMPLAINT:     ["COMPLAINT"],
     IntentCategory.CONTACT_GIVE:  ["LEAD_CAPTURE"],
     IntentCategory.CONTACT_NO:    ["CONTACT_NO"],
-    IntentCategory.CONTACT_FIX:   ["CONTACT_FIX"],
+    IntentCategory.CONTACT_FIX:   ["LEAD_CAPTURE"],
     IntentCategory.CHITCHAT:      ["GREETING", "WEATHER"],
 }
 
@@ -185,6 +185,7 @@ class Planner:
         self.client = AsyncAnthropic(api_key=api_key, base_url=base_url)
         self.model = model
         self._cache: Dict[str, PlannerOutput] = {}
+        self._fallback = None  # 延迟初始化
 
     # ── 主入口 ─────────────────────────────────────────────────────────────
 
@@ -301,6 +302,7 @@ class Planner:
         user_parts.append(f"用户消息:\n{message}")
         user_content = self._clean_text("\n\n".join(user_parts))
 
+        # 首次 LLM 调用
         try:
             resp = await self.client.messages.create(
                 model=self.model,
@@ -310,18 +312,43 @@ class Planner:
                 messages=[{"role": "user", "content": user_content}],
             )
             raw = resp.content[0].text
+        except Exception as ex:
+            # 网络异常：带完整上下文重试一次
+            logger.warning(f"Planner LLM 调用失败（网络异常），重试一次: {ex}")
+            try:
+                resp = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=512,
+                    temperature=0.1,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_content}],
+                )
+                raw = resp.content[0].text
+            except Exception as ex2:
+                logger.warning(f"Planner LLM 重试仍失败，触发降级: {ex2}")
+                return await self._fallback_plan(message, existing_slots)
+
+        # JSON 解析
+        try:
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
         except Exception as ex:
-            logger.warning(f"Planner LLM 调用失败: {ex}")
-            return PlannerOutput(
-                primary_intent=IntentCategory.CHITCHAT.value,
-                sub_tasks=["GREETING"],
-                slot_ops=[],
-                emotion=Sentiment.NEUTRAL.value,
-                confidence=0.0,
-                reasoning=f"Planner 失败: {ex}",
-            )
+            # JSON 格式异常：只传坏输出让 LLM 修正，无需用户上下文
+            logger.warning(f"Planner JSON 解析失败，让 LLM 修正: {ex}")
+            try:
+                resp2 = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=512,
+                    temperature=0.1,
+                    system="你是一个 JSON 修复助手。只输出修正后的合法 JSON，不要代码块、不要额外说明。",
+                    messages=[{"role": "user", "content": f"修正以下 JSON 格式：\n{raw}"}],
+                )
+                raw = resp2.content[0].text
+                s, e = raw.find("{"), raw.rfind("}") + 1
+                data = json.loads(raw[s:e])
+            except Exception as ex2:
+                logger.warning(f"Planner JSON 修正仍失败，触发降级: {ex2}")
+                return await self._fallback_plan(message, existing_slots)
 
         # 解析并校验
         primary = data.get("primary_intent", IntentCategory.CHITCHAT.value)
@@ -363,6 +390,32 @@ class Planner:
             confidence=float(data.get("confidence", 0.8)),
             reasoning=data.get("reasoning", ""),
         )
+
+    # ── 降级 ──────────────────────────────────────────────────────────────
+
+    async def _fallback_plan(
+        self,
+        message: str,
+        existing_slots: Optional[Dict[str, Any]],
+    ) -> PlannerOutput:
+        """LLM 不可用时触发降级意图识别。
+
+        使用 PlannerFallback（纯代码）替代 LLM 完成语义理解 + 槽位提取。
+        仅当 LLM 调用失败时调用，不会主动触发。
+
+        Args:
+            message: 用户消息
+            existing_slots: 当前会话已有槽位
+
+        Returns:
+            PlannerOutput，结构和正常结果一致
+        """
+        from core.planner_fallback import PlannerFallback
+
+        if self._fallback is None:
+            self._fallback = PlannerFallback()
+
+        return self._fallback.plan(message=message, existing_slots=existing_slots)
 
     # ── 辅助 ──────────────────────────────────────────────────────────────
 

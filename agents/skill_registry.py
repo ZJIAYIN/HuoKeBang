@@ -22,7 +22,6 @@ from agents.skills.lead_capture import LeadCaptureSkill
 from agents.skills.greeting import GreetingSkill
 from agents.skills.purchase import PurchaseSkill
 from agents.skills.contact_no import ContactNoSkill
-from agents.skills.contact_fix import ContactFixSkill
 from agents.skills.weather import WeatherSkill
 
 logger = logging.getLogger(__name__)
@@ -83,7 +82,6 @@ class SkillRegistry:
             GreetingSkill,
             PurchaseSkill,
             ContactNoSkill,
-            ContactFixSkill,
             WeatherSkill,
         ]
         for s in skills:

@@ -10,14 +10,19 @@ LEAD_COOLDOWN_HOURS = 24
 
 
 class LeadCaptureSkill(BaseSkill):
+    """留资引导 Skill：引导用户留资或确认已留联系方式。"""
+
     name = "LEAD_CAPTURE"
     required_slots = ["phone"]
-    required_tools = []
+    required_tools = [Tool.PHONE_VALIDATE]
+    auto_evaluate = True
+
+    # instruction 只处理"确认"场景。
+    # "引导留资"场景由框架自动处理——phone 缺失时进入 pending(missing=phone)，
+    # LLM 在回复末尾自然追问。
     instruction = (
         "用户提供了联系方式，确认并感谢。"
         "告知用户稍后会有顾问联系。"
-        "如果用户没有主动提供但情绪良好，可以自然引导留资。"
-        "如果用户拒绝，不要纠缠，表示理解。"
     )
 
     @classmethod
@@ -68,17 +73,31 @@ class LeadCaptureSkill(BaseSkill):
     @classmethod
     def can_execute(cls, slots: Dict[str, Any], emotion: str = "") -> bool:
         """
-        留资 Skill 有特殊的执行逻辑：
-        - 用户已给 phone → 可以执行（确认并感谢）
-        - 用户没给 phone → 检查拒绝留资标记 + 情绪
+        执行条件：情绪 OK + 不在冷却期 + phone 已提供。
+
+        四种结果（对应 get_pending_info 诊断）：
+        - 情绪差          → False（pending：情绪不适合）
+        - 拒绝冷却期内    → False（静默跳过）
+        - phone 缺失      → False（pending：缺少 phone → LLM 追问）
+        - phone 存在      → True（completed：确认联系方式）
         """
         if not cls.check_emotion(emotion):
             return False
-        # 有 phone → 可以执行（即使用户之前拒绝过，这次主动给了也要处理）
-        if slots.get("phone"):
-            return True
-        # 没 phone，检查用户是否在冷却期内拒绝过
         if cls._is_lead_refused(slots):
             return False
-        # 没 phone，情绪好，没有拒绝标记 → 可以追问留资
-        return True
+        # phone 检查走默认 check_slots（required_slots=["phone"]）
+        return len(cls.check_slots(slots)) == 0
+
+    @classmethod
+    def get_pending_info(cls, slots: Dict[str, Any], emotion: str) -> Dict[str, Any]:
+        """
+        覆盖基类：将 _is_lead_refused 放在 check_slots 之前判断，
+        避免"拒绝留资但 phone 也缺失"时被错误诊断为"缺少 phone"。
+        """
+        if not cls.check_emotion(emotion):
+            return {"reason": f"情绪 '{emotion}' 不适合执行此任务"}
+        if cls._is_lead_refused(slots):
+            return {"silent": True}
+        if not slots.get("phone"):
+            return {"missing": ["phone"]}
+        return {"silent": True}

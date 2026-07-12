@@ -14,49 +14,14 @@ RAG 知识库 —— 混合检索（向量 + BM25 关键词）+ RRF 融合。
 import hashlib
 import logging
 import math
+import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import chromadb
 import jieba
-from chromadb import Documents, Embeddings, EmbeddingFunction
 
 logger = logging.getLogger(__name__)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# BGE 中文嵌入模型（ONNX 轻量版，通过 fastembed 加载，无需 PyTorch）
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class BGEChineseEmbeddingFunction(EmbeddingFunction):
-    """BGE 中文嵌入模型适配器 for ChromaDB。
-
-    文档嵌入：embed() 无前缀
-    查询嵌入：query_embed() 自动加 BGE 检索前缀
-    """
-
-    def __init__(self, model_name: str = "BAAI/bge-small-zh-v1.5"):
-        """初始化 BGE 嵌入模型。
-
-        Args:
-            model_name: 模型名称，默认 bge-small-zh-v1.5（384 维）
-        """
-        from fastembed import TextEmbedding
-        self._model = TextEmbedding(model_name=model_name)
-        self._model_name = model_name
-
-    def __call__(self, input: Documents) -> Embeddings:
-        """文档索引：embed() 不加前缀。"""
-        return list(self._model.embed(input))
-
-    def embed_query(self, query: str) -> Embeddings:
-        """检索查询：query_embed() 自动加 BGE 检索前缀。"""
-        return list(self._model.query_embed(query))
-
-    @property
-    def dimension(self) -> int:
-        """获取嵌入向量维度。"""
-        return len(list(self._model.embed(["dim"]))[0])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -265,24 +230,19 @@ class KnowledgeBase:
     # ── 递归切割的分隔符优先级（从粗到细）────────────────────────────────────
     _SEPARATORS = ["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""]
 
-    # 默认嵌入模型（BGE 中文系列，通过 fastembed ONNX 加载，免 torch）
-    DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
-
     def __init__(
         self,
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
-        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ):
-        # 初始化 BGE 中文嵌入模型
-        self._embedder = BGEChineseEmbeddingFunction(model_name=embedding_model)
-        logger.info(
-            f"嵌入模型: {embedding_model} "
-            f"(维度: {self._embedder.dimension}, "
-            f"推理: fastembed ONNX)"
-        )
+        """初始化知识库，使用 ChromaDB 内置嵌入模型。
 
+        Args:
+            chroma_host: ChromaDB 服务地址（HTTP 模式）
+            chroma_port: ChromaDB 服务端口
+            chroma_path: 本地持久化路径（HTTP 不可用时降级使用）
+        """
         # 优先连接独立 ChromaDB 服务
         self._use_server = False
         try:
@@ -297,26 +257,12 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 检测已有集合的嵌入模型是否匹配，不匹配则重建
-        try:
-            existing = self._client.get_collection(self.COLLECTION_NAME)
-            old_model = existing.metadata.get("embedding_model", "") if existing.metadata else ""
-            if old_model and old_model != embedding_model:
-                logger.warning(
-                    f"嵌入模型已变更: {old_model} → {embedding_model}，"
-                    "重建集合（旧向量与新模型不兼容）"
-                )
-                self._client.delete_collection(self.COLLECTION_NAME)
-        except (ValueError, chromadb.errors.NotFoundError):
-            pass  # 集合不存在，首次创建
-
+        # 使用 ChromaDB 内置嵌入模型
         try:
             self._collection = self._client.get_or_create_collection(
                 name=self.COLLECTION_NAME,
-                embedding_function=self._embedder,
                 metadata={
                     "description": "EchoMind RAG 知识库（混合检索：向量 + BM25 → RRF）",
-                    "embedding_model": embedding_model,
                 },
             )
         except ValueError as _e:
@@ -325,10 +271,8 @@ class KnowledgeBase:
                 self._client.delete_collection(self.COLLECTION_NAME)
                 self._collection = self._client.get_or_create_collection(
                     name=self.COLLECTION_NAME,
-                    embedding_function=self._embedder,
                     metadata={
                         "description": "EchoMind RAG 知识库（混合检索：向量 + BM25 → RRF）",
-                        "embedding_model": embedding_model,
                     },
                 )
             else:
@@ -622,6 +566,7 @@ class KnowledgeBase:
         """
         递归切割 + 贪心凑块 + overlap 50。
 
+        Phase 0: 提取 [表格开始]...[表格结束] 区域为原子块，避免表格被拆散
         Phase 1: 递归拆到每个碎片 ≤ CHUNK_SIZE
         Phase 2: 贪心合并碎片，尽量接近 CHUNK_SIZE
         Phase 3: 相邻块之间重叠 OVERLAP 字符
@@ -629,8 +574,16 @@ class KnowledgeBase:
         if not text or not text.strip():
             return []
 
-        # Phase 1: 递归拆到最小
-        pieces = self._split_recursive(text)
+        # Phase 0: 提取表格预块，保证表格不被后续切分拆散
+        mixed = self._split_preserve_tables(text)
+
+        # Phase 1: 递归拆分（跳过表格预块）
+        pieces = []
+        for is_table, segment in mixed:
+            if is_table:
+                pieces.append(segment)
+            else:
+                pieces.extend(self._split_recursive(segment))
 
         # Phase 2: 贪心凑块
         merged = self._merge_greedy(pieces)
@@ -721,22 +674,42 @@ class KnowledgeBase:
 
         return result
 
+    @classmethod
+    def _split_preserve_tables(cls, text: str) -> List[Tuple[bool, str]]:
+        """
+        提取 [表格开始]...[表格结束] 包裹的区域作为原子块，
+        保证表格不被递归切分器拆散。
+
+        返回 [(is_table, segment), ...] 混合列表，
+        is_table=True 的段是完整的表格内容，跳过递归拆分。
+        """
+        pattern = r'(\[表格开始\]\n.*?\n\[表格结束\])'
+        parts = re.split(pattern, text, flags=re.DOTALL)
+        result: List[Tuple[bool, str]] = []
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith('[表格开始]') and part.endswith('[表格结束]'):
+                inner = part[len('[表格开始]\n'):-len('\n[表格结束]')]
+                result.append((True, inner))
+            else:
+                result.append((False, part))
+        return result
+
     # ══════════════════════════════════════════════════════════════════════════
     # 检索内部方法
     # ══════════════════════════════════════════════════════════════════════════
 
     def _vector_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """纯 ChromaDB 向量语义检索（使用 BGE 中文嵌入 + 检索前缀）。"""
+        """纯 ChromaDB 向量语义检索（使用 ChromaDB 内置嵌入模型）。"""
         if self._collection.count() == 0:
             return []
 
         n = min(top_k, self._collection.count())
 
-        # 用 BGE 模型计算查询嵌入（加检索前缀），绕过 ChromaDB 内置的 __call__
-        query_emb = self._embedder.embed_query(query)
-
+        # 由 ChromaDB 内置模型完成嵌入 + 检索
         results = self._collection.query(
-            query_embeddings=query_emb,
+            query_texts=[query],
             n_results=n,
         )
 

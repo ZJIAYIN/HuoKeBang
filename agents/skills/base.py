@@ -20,10 +20,11 @@ from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
 class Tool(Enum):
     """Orchestrator 统一调度的工具类型"""
-    RAG = "rag"          # 知识库检索
-    CRM = "crm"          # 客户关系管理（预留）
-    CALCULATOR = "calc"  # 金融计算器（预留）
-    WEATHER = "weather"  # 天气查询（调用第三方 API）
+    RAG = "rag"             # 知识库检索
+    CRM = "crm"             # 客户关系管理（预留）
+    CALCULATOR = "calc"     # 金融计算器（预留）
+    WEATHER = "weather"     # 天气查询（调用第三方 API）
+    PHONE_VALIDATE = "phone_validate"  # 手机号格式校验
 
 
 class BaseSkill:
@@ -38,6 +39,7 @@ class BaseSkill:
     optional_slots: List[str] = []       # 可选的槽位列表
     required_tools: List[Tool] = []      # 需要的工具列表
     instruction: str = ""                # 给 Response Agent 的指令
+    auto_evaluate: bool = False          # True = 不在 sub_tasks 中也自动评估
 
     @classmethod
     def check_slots(cls, slots: Dict[str, Any]) -> List[str]:
@@ -63,7 +65,33 @@ class BaseSkill:
 
     @classmethod
     def can_execute(cls, slots: Dict[str, Any], emotion: str = "") -> bool:
-        """综合判断是否可以执行（slots + emotion）。"""
+        """
+        判断技能是否可以执行。子类可完全重写。
+
+        Orchestrator 只调这一个方法做执行决策。
+        默认行为 = check_emotion + check_slots。
+        """
         if not cls.check_emotion(emotion):
             return False
         return len(cls.check_slots(slots)) == 0
+
+    @classmethod
+    def get_pending_info(cls, slots: Dict[str, Any], emotion: str) -> Dict[str, Any]:
+        """
+        can_execute 返回 False 时的结构化原因，供 Orchestrator 展示。
+
+        返回值：
+          {"reason": "..."}   → pending，LLM 看到原因文本
+          {"missing": [...]}  → pending，LLM 在末尾追问缺失槽位
+          {"silent": True}    → 安静跳过，不进 pending
+
+        子类覆盖此方法时，须与 can_execute 的判断逻辑保持一致。
+        """
+        info: Dict[str, Any] = {}
+        if not cls.check_emotion(emotion):
+            info["reason"] = f"情绪 '{emotion}' 不适合执行此任务"
+        elif missing := cls.check_slots(slots):
+            info["missing"] = missing
+        else:
+            info["silent"] = True
+        return info

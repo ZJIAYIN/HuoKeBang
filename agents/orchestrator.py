@@ -96,16 +96,18 @@ class Orchestrator:
         self,
         planner_output: PlannerOutput,
         slot_manager: SlotManager,
-        memory_context: str = "",  # 来自 MemoryManager.to_prompt_text()
+        memory_context: str = "",
     ) -> ResponseInput:
         """
         执行编排流程。
 
         步骤：
           1. 应用 slot_ops → 更新 Slot Manager
-          2. 遍历 sub_tasks → 匹配 Skill → 检查 slot + emotion
-          3. 收集 required_tools → 执行 Tool Layer
-          4. 构建 Response Agent 输入
+          2. 槽位生命周期规则：phone/wechat 变更 → 自动清除关联标记
+          3. 构建任务列表：显式 sub_tasks + auto_evaluate 技能
+          4. 遍历任务：can_execute → completed / get_pending_info → pending
+          5. 收集 required_tools → 执行 Tool Layer
+          6. 构建 Response Agent 输入
         """
         # 1. 更新槽位
         slot_ops = [
@@ -117,39 +119,58 @@ class Orchestrator:
             for o in planner_output.slot_ops
         ]
         slot_manager.apply(slot_ops)
+
+        # ── 槽位生命周期规则 ──
+        # 当用户给了新手机号时，自动清除所有旧标记。
+        # 不依赖 Planner 发 DELETE，不依赖任何 skill。
+        for op in planner_output.slot_ops:
+            if op.op.value == "SET" and op.slot in ("phone", "wechat"):
+                slot_manager.delete("lead_refused")
+                slot_manager.delete("lead_refused_at")
+
         slots = slot_manager.all
 
-        # 2. 遍历 sub_tasks（后台始终追加 LEAD_CAPTURE）
-        if "LEAD_CAPTURE" not in planner_output.sub_tasks:
-            planner_output.sub_tasks.append("LEAD_CAPTURE")
+        # ── 手机号格式校验 ──
+        # Planner 可能把 "129870908-8" 这种也当成手机号提取了。
+        # 用正则硬校验，不合法就删掉，让 LeadCapture 自然走 missing 流程。
+        phone = slots.get("phone")
+        if phone is not None:
+            import re as _re
+            digits = _re.sub(r"\D", "", str(phone))
+            if not (len(digits) == 11 and digits.startswith("1")):
+                slot_manager.delete("phone")
+                slots = slot_manager.all  # 刷新
+                logger.warning(f"手机号格式校验不通过，已删除: {phone!r}")
+
+        # 2. 构建任务列表：显式 sub_tasks + auto_evaluate 技能
+        all_tasks = list(planner_output.sub_tasks)
+        for name, skill_cls in SkillRegistry.all().items():
+            if skill_cls.auto_evaluate and name not in all_tasks:
+                all_tasks.append(name)
+
         completed: List[str] = []
         pending: List[Dict[str, Any]] = []
         all_instructions: List[str] = []
         all_tools: set = set()
 
-        for task in planner_output.sub_tasks:
+        # 3. 统一评估循环
+        for task in all_tasks:
             skill = SkillRegistry.get(task)
             if skill is None:
                 logger.debug(f"编排: 跳过未知 sub_task={task}")
                 continue
 
-            # 检查 emotion
-            if not skill.check_emotion(planner_output.emotion):
-                pending.append({"skill": task, "reason": f"情绪 '{planner_output.emotion}' 不适合执行此任务"})
-                continue
+            if skill.can_execute(slots, planner_output.emotion):
+                completed.append(task)
+                all_instructions.append(skill.instruction)
+                all_tools.update(skill.required_tools)
+            else:
+                info = skill.get_pending_info(slots, planner_output.emotion)
+                if info.get("silent"):
+                    continue  # 安静跳过，不进 pending
+                pending.append({"skill": task, **info})
 
-            # 检查 slots
-            missing = skill.check_slots(slots)
-            if missing:
-                pending.append({"skill": task, "missing": missing})
-                continue
-
-            # 可执行
-            completed.append(task)
-            all_instructions.append(skill.instruction)
-            all_tools.update(skill.required_tools)
-
-        # 3. 统一执行 Tool Layer
+        # 4. 统一执行 Tool Layer
         tool_results: Dict[str, Any] = {}
         if all_tools:
             tool_results = await self.tool_layer.exec_tools(
@@ -159,7 +180,7 @@ class Orchestrator:
                 slots=slots,
             )
 
-        # 4. 构建 Response 输入
+        # 5. 构建 Response 输入
         return ResponseInput(
             instructions=all_instructions,
             knowledge=tool_results.get("rag", []),
@@ -191,7 +212,11 @@ class ResponseAgent:
 回复规范：
 1. 语气专业亲和，使用中文
 2. 先安抚后回复（用户情绪差时，先共情再解决问题）
-3. 使用 Knowledge 中的内容回答，没有知识来源的不要编造
+3. 知识使用规则：
+   - 对于产品咨询、价格查询、金融方案等需要知识库才能回答的问题：
+     必须严格按照【知识】中的内容回答，不编造、不推测
+     如果【知识】中没有相关信息，请回复"抱歉，我暂时没有这方面的信息，建议咨询门店获取详细信息"
+   - 对于问候、投诉处理、天气查询、购买意向等不需要知识库的场景：正常回复即可
 4. 如果多个任务，回复时要自然过渡，不要生硬分段
 5. 如果 pending 中有等待的信息，在回复末尾自然追问
 6. 不要在知识未覆盖的领域提供具体承诺（如具体价格、到货时间）

@@ -32,6 +32,8 @@ const api = {
   kbClear:      ()                     => api._fetch('DELETE', '/knowledge'),
   memProfiles:  ()                     => api._fetch('GET', '/memory/profiles'),
   memEpisodic:  ()                     => api._fetch('GET', '/memory/episodic'),
+  memDeleteProfile:  (uid)             => api._fetch('DELETE', '/memory/profile' + (uid ? `?user_id=${encodeURIComponent(uid)}` : '')),
+  memDeleteEpisodic: (uid)             => api._fetch('DELETE', '/memory/episodic' + (uid ? `?user_id=${encodeURIComponent(uid)}` : '')),
 };
 
 // 流式对话：返回一个 {meta, tokens[], done} 对象

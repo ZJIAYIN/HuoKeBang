@@ -94,7 +94,20 @@ class MemoryManager:
         self._client = AsyncAnthropic(api_key=api_key, base_url=base_url)
         self._model  = model
 
-        self._redis = redis.from_url(redis_url, decode_responses=True)
+        self._redis: Optional[redis.Redis] = None
+        try:
+            _redis = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=3,
+                socket_connect_timeout=3,
+            )
+            _redis.ping()
+            self._redis = _redis
+            logger.info(f"MemoryManager 已连接 Redis: {redis_url}")
+        except Exception as ex:
+            self._redis = None
+            logger.warning(f"MemoryManager Redis 不可用，降级为无记忆模式: {ex}")
 
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
         try:
@@ -123,7 +136,19 @@ class MemoryManager:
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """将一条消息写入工作记忆，超阈值时自动压缩。"""
+        """将一条消息写入工作记忆，超阈值时自动压缩。
+
+        Redis 不可用时静默跳过，不阻塞主流程。
+
+        Args:
+            user_id: 用户 ID
+            conv_id: 会话 ID
+            role: 消息角色（user/assistant）
+            content: 消息内容
+            metadata: 附加元数据
+        """
+        if not self._redis:
+            return
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         clean_metadata = {
@@ -133,18 +158,21 @@ class MemoryManager:
         msg = Message(role=role, content=self._safe_text(content), metadata=clean_metadata)
         key = self._wm_key(user_id, conv_id)
 
-        # 追加到 Redis 列表（左推，最新在前）
-        self._redis.lpush(key, json.dumps({
-            "role":      msg.role.value,
-            "content":   msg.content,
-            "ts":        msg.timestamp.isoformat(),
-            "metadata":  msg.metadata,
-        }))
-        self._redis.expire(key, 86400)  # 24h TTL
+        try:
+            # 追加到 Redis 列表（左推，最新在前）
+            self._redis.lpush(key, json.dumps({
+                "role":      msg.role.value,
+                "content":   msg.content,
+                "ts":        msg.timestamp.isoformat(),
+                "metadata":  msg.metadata,
+            }))
+            self._redis.expire(key, 86400)  # 24h TTL
 
-        # 超过压缩阈值时触发压缩
-        if self._redis.llen(key) >= self.COMPRESS_AT:
-            await self._compress(user_id, conv_id)
+            # 超过压缩阈值时触发压缩
+            if self._redis.llen(key) >= self.COMPRESS_AT:
+                await self._compress(user_id, conv_id)
+        except Exception as ex:
+            logger.warning(f"写入工作记忆失败: {ex}")
 
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
@@ -222,7 +250,12 @@ class MemoryManager:
         profile = await self._get_profile(user_id)
 
         # 4. 会话摘要（如果已压缩过）
-        summary = self._redis.get(self._summary_key(user_id, conv_id)) or ""
+        summary = ""
+        if self._redis:
+            try:
+                summary = self._redis.get(self._summary_key(user_id, conv_id)) or ""
+            except Exception as ex:
+                logger.warning(f"读取会话摘要失败: {ex}")
 
         return MemoryContext(
             recent_messages=recent,
@@ -279,6 +312,62 @@ class MemoryManager:
             logger.warning(f"列出情景记忆失败: {ex}")
             return []
 
+    # ── 清除 ──────────────────────────────────────────────────────────────────
+
+    def clear_profile(self, user_id: Optional[str] = None) -> int:
+        """清除用户画像。不传 user_id 则清除全部。返回删除的记录数。"""
+        try:
+            where = {"user_id": user_id} if user_id else None
+            result = self._profile.get(where=where)
+            ids = result.get("ids", [])
+            if ids:
+                self._profile.delete(ids=ids)
+                tag = f"user={user_id}" if user_id else "全部"
+                logger.info(f"用户画像已清除: {tag}, 删除 {len(ids)} 条")
+            return len(ids)
+        except Exception as ex:
+            logger.warning(f"清除用户画像失败: {ex}")
+            return 0
+
+    def clear_episodic(self, user_id: Optional[str] = None) -> int:
+        """清除情景记忆。不传 user_id 则清除全部。返回删除的记录数。"""
+        try:
+            where = {"user_id": user_id} if user_id else None
+            result = self._episodic.get(where=where)
+            ids = result.get("ids", [])
+            if ids:
+                self._episodic.delete(ids=ids)
+                tag = f"user={user_id}" if user_id else "全部"
+                logger.info(f"情景记忆已清除: {tag}, 删除 {len(ids)} 条")
+            return len(ids)
+        except Exception as ex:
+            logger.warning(f"清除情景记忆失败: {ex}")
+            return 0
+
+    def clear_working_memory(self, user_id: str, conv_id: str) -> bool:
+        """清除指定会话的工作记忆（Redis）。
+
+        Redis 不可用时返回 False。
+
+        Args:
+            user_id: 用户 ID
+            conv_id: 会话 ID
+
+        Returns:
+            True=清除成功
+        """
+        if not self._redis:
+            return False
+        try:
+            wm_key = self._wm_key(user_id, conv_id)
+            skey = self._summary_key(user_id, conv_id)
+            self._redis.delete(wm_key, skey)
+            logger.info(f"工作记忆已清除: {wm_key}")
+            return True
+        except Exception as ex:
+            logger.warning(f"清除工作记忆失败: {ex}")
+            return False
+
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
     async def _compress(self, user_id: str, conv_id: str) -> None:
@@ -288,7 +377,11 @@ class MemoryManager:
           2. 摘要存 Redis（覆盖旧摘要）
           3. 旧消息存入情景记忆（ChromaDB）供跨会话检索
           4. 工作记忆只保留最近 5 条
+
+        Redis 不可用时跳过压缩，不阻塞。
         """
+        if not self._redis:
+            return
         messages = await self._get_working_memory(user_id, conv_id)
         if len(messages) < self.COMPRESS_AT:
             return
@@ -331,17 +424,39 @@ class MemoryManager:
     # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
     async def _get_working_memory(self, user_id: str, conv_id: str) -> List[Message]:
-        key  = self._wm_key(user_id, conv_id)
-        raws = self._redis.lrange(key, 0, self.WORKING_MAX - 1)
+        """读取当前会话的工作记忆（Redis 列表）。
+
+        Redis 不可用时返回空列表。
+
+        Args:
+            user_id: 用户 ID
+            conv_id: 会话 ID
+
+        Returns:
+            Message 列表，按时间正序
+        """
+        if not self._redis:
+            return []
+        key = self._wm_key(user_id, conv_id)
+        try:
+            raws = self._redis.lrange(key, 0, self.WORKING_MAX - 1)
+        except Exception as ex:
+            logger.warning(f"读取工作记忆失败: {ex}")
+            return []
+
         msgs = []
         for raw in reversed(raws):  # Redis lpush 最新在前，reversed 还原时序
-            d = json.loads(raw)
-            msgs.append(Message(
-                role=MsgRole(d["role"]),
-                content=d["content"],
-                timestamp=datetime.fromisoformat(d["ts"]),
-                metadata=d.get("metadata", {}),
-            ))
+            try:
+                d = json.loads(raw)
+                msgs.append(Message(
+                    role=MsgRole(d["role"]),
+                    content=d["content"],
+                    timestamp=datetime.fromisoformat(d["ts"]),
+                    metadata=d.get("metadata", {}),
+                ))
+            except (json.JSONDecodeError, KeyError, ValueError) as ex:
+                logger.warning(f"工作记忆消息解析失败，跳过: {ex}")
+                continue
         return msgs
 
     async def _search_episodic(self, user_id: str, query: str) -> List[str]:

@@ -11,7 +11,7 @@ const ChatView = {
     const userInput   = ref('');
     const loading     = ref(false);
     const error       = ref(null);
-    const convId      = ref(null);
+    const convId      = ref(localStorage.getItem('echomind_conv_id'));
     const showInfo    = ref(true);
     const currentMsg  = ref(null);
     const streaming   = ref(false);
@@ -73,11 +73,16 @@ const ChatView = {
         );
 
         convId.value = result.done?.conv_id || convId.value || result.meta?.conv_id;
+        if (convId.value) localStorage.setItem('echomind_conv_id', convId.value);
         streamMeta = result.meta;
 
         if (result.done) {
           // 用 done 里的完整信息更新
           const d = result.done;
+          if (d.response && !fullResponse) {
+            fullResponse = d.response;
+            messages[msgIdx].content = fullResponse;
+          }
           const sks = (d.skill_statuses || []).filter(s => s.status === 'success').map(s => s.name);
           const metaObj = {
             intent:     d.primary_intent || streamMeta?.primary_intent || '',
@@ -147,6 +152,7 @@ const ChatView = {
     function newConversation() {
       messages.splice(0);
       convId.value = null;
+      localStorage.removeItem('echomind_conv_id');
       currentMsg.value = null;
       error.value = null;
       $toast('info', '已开始新对话');

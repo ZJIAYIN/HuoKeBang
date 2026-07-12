@@ -11,6 +11,7 @@ const MemoryView = {
     const profiles  = ref([]);
     const episodic  = ref([]);
     const loading   = ref(false);
+    const deleting  = ref(false);
     const error     = ref(null);
 
     const { $api, $toast, $icons } = Vue.getCurrentInstance().appContext.config.globalProperties;
@@ -52,6 +53,39 @@ const MemoryView = {
       if (s === 'episodic' && !episodic.value.length) loadEpisodic();
     }
 
+    // ── 删除 ────────────────────────────────────────────
+    async function deleteProfiles(userId) {
+      const label = userId ? `用户 ${userId}` : '全部';
+      if (!confirm(`确认清除${label}的用户画像？此操作不可恢复。`)) return;
+      deleting.value = true;
+      try {
+        await $api.memDeleteProfile(userId || null);
+        $toast('success', `用户画像已清除 (${label})`);
+        profiles.value = [];
+        loadProfiles();
+      } catch (err) {
+        $toast('error', `清除失败: ${err.message}`);
+      } finally {
+        deleting.value = false;
+      }
+    }
+
+    async function deleteEpisodic(userId) {
+      const label = userId ? `用户 ${userId}` : '全部';
+      if (!confirm(`确认清除${label}的情景记忆？此操作不可恢复。`)) return;
+      deleting.value = true;
+      try {
+        await $api.memDeleteEpisodic(userId || null);
+        $toast('success', `情景记忆已清除 (${label})`);
+        episodic.value = [];
+        loadEpisodic();
+      } catch (err) {
+        $toast('error', `清除失败: ${err.message}`);
+      } finally {
+        deleting.value = false;
+      }
+    }
+
     // ── 格式化时间 ───────────────────────────────────────
     function formatTime(ts) {
       if (!ts) return '-';
@@ -74,8 +108,9 @@ const MemoryView = {
     loadProfiles();
 
     return {
-      section, profiles, episodic, loading, error,
+      section, profiles, episodic, loading, deleting, error,
       switchSection, formatTime, renderValue, $icons,
+      deleteProfiles, deleteEpisodic,
     };
   },
 
@@ -113,13 +148,24 @@ const MemoryView = {
 
         <!-- 列表 -->
         <div v-else>
+          <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+            <button class="btn btn-sm btn-danger" :disabled="deleting" @click="deleteProfiles('')">
+              <span v-if="deleting" class="spinner-sm"></span>
+              <span v-else>🗑</span> 清除全部
+            </button>
+          </div>
           <div v-for="p in profiles" :key="p.user_id || p.id" class="memory-card">
             <div class="memory-card-header">
               <div class="memory-card-title">
                 <span v-html="$icons.user" style="width:16px;height:16px;display:inline-block;vertical-align:middle;margin-right:6px"></span>
                 {{ p.user_id || p.id || '未知用户' }}
               </div>
-              <div class="memory-card-date">{{ formatTime(p.updated_at || p.last_update) }}</div>
+              <div style="display:flex;align-items:center;gap:8px">
+                <div class="memory-card-date">{{ formatTime(p.updated_at || p.last_update) }}</div>
+                <button class="btn-icon" title="删除此用户画像" :disabled="deleting" @click="deleteProfiles(p.user_id)">
+                  <span style="color:var(--error)">✕</span>
+                </button>
+              </div>
             </div>
             <div class="memory-card-content">
               <div v-for="(val, key) in p" :key="key"
@@ -155,6 +201,12 @@ const MemoryView = {
 
         <!-- 列表 -->
         <div v-else>
+          <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+            <button class="btn btn-sm btn-danger" :disabled="deleting" @click="deleteEpisodic('')">
+              <span v-if="deleting" class="spinner-sm"></span>
+              <span v-else>🗑</span> 清除全部
+            </button>
+          </div>
           <div v-for="(item, i) in episodic" :key="i" class="memory-card">
             <div class="memory-card-header">
               <div class="memory-card-title">
