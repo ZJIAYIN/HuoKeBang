@@ -22,6 +22,9 @@ const ChatView = {
     const { $api, $toast, $icons, $chatStream } = Vue.getCurrentInstance().appContext.config.globalProperties;
     const nextTick = Vue.nextTick;
 
+    // 反馈状态：{ msgIdx: 'up' | 'down' }
+    const feedbackState = reactive({});
+
     // 保存 user_id
     function setUserId(val) {
       userId.value = val || 'anonymous';
@@ -155,6 +158,7 @@ const ChatView = {
       localStorage.removeItem('echomind_conv_id');
       currentMsg.value = null;
       error.value = null;
+      for (const key in feedbackState) delete feedbackState[key];
       $toast('info', '已开始新对话');
     }
 
@@ -166,11 +170,42 @@ const ChatView = {
       }
     }
 
+    // ── Bad Case 反馈（👎）─────────────────────────────────
+    async function reportBadCase(msgIdx) {
+      const msg = messages[msgIdx];
+      if (!msg || msg.role !== 'ai' || feedbackState[msgIdx] === 'down') return;
+      feedbackState[msgIdx] = 'down';
+
+      try {
+        await $api.feedbackBadcase({
+          query: messages[msgIdx - 1]?.content || '',
+          response: msg.content || '',
+          predicted_sub_tasks: msg.meta?.skills || [],
+          conv_id: convId.value || '',
+          user_id: userId.value || '',
+        });
+        $toast('info', '已反馈，感谢帮助改进！');
+      } catch (err) {
+        feedbackState[msgIdx] = null;
+        console.warn('反馈失败:', err);
+      }
+    }
+
+    // ── 好评（👍）──────────────────────────────────────────
+    function goodFeedback(msgIdx) {
+      if (feedbackState[msgIdx] === 'up') {
+        feedbackState[msgIdx] = null;
+      } else {
+        feedbackState[msgIdx] = 'up';
+      }
+    }
+
     return {
       messages, userInput, loading, error, convId,
       showInfo, currentMsg, streaming, userId,
       sendMessage, newConversation, handleKeydown, autoResize,
       setUserId, $icons,
+      feedbackState, reportBadCase, goodFeedback,
     };
   },
 
@@ -213,6 +248,15 @@ const ChatView = {
               <span v-for="s in msg.meta.skills" :key="s" class="meta-tag skill">{{ s }}</span>
               <span v-if="msg.meta.knowledge" class="meta-tag knowledge">知识库</span>
               <span v-if="msg.meta.latency" class="meta-tag latency">{{ msg.meta.latency.toFixed(0) }} ms</span>
+            </div>
+            <!-- 反馈按钮（仅 AI 消息且非流式时显示） -->
+            <div v-if="msg.role === 'ai' && msg.meta && !(streaming && i === messages.length - 1)" class="feedback-bar">
+              <button class="feedback-btn up" :class="{ active: feedbackState[i] === 'up' }"
+                @click="goodFeedback(i)" :title="feedbackState[i] === 'up' ? '取消' : '有帮助'"
+                v-html="$icons.thumbsUp"></button>
+              <button class="feedback-btn down" :class="{ active: feedbackState[i] === 'down' }"
+                @click="reportBadCase(i)" :title="反馈不准确"
+                v-html="$icons.thumbsDown"></button>
             </div>
           </div>
         </template>

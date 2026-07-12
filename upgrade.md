@@ -244,8 +244,8 @@ report, _ = await evaluator.eval(test_cases, detail=True)
 
 评估指标：
 
-- **Macro F1**：降级后的意图分类准确率
-- **Slot Exact Match Rate**：正则提取的槽位准确率
+- **Macro F1**：降级后的意图分类准确率（每类意图独立算 F1 再宏平均）
+- **Exact Match Rate**：降级后 sub_task 集合完全一致的用例比例
 - **Degradation Rate**：触发降级时的正确率（fallback planner 对了多少次）
 
 ---

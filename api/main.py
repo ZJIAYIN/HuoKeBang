@@ -767,14 +767,19 @@ def _load_default_test_cases() -> List[Dict[str, Any]]:
 @app.post("/eval/multi")
 async def eval_multi(body: MultiEvalInput):
     """
-    Multi-Intent 评估。
+    Multi-Intent 评估（简化版）。
 
     评估维度：
-      - Sub-task 多标签分类（Macro F1 + Exact Match Rate）
-      - Slot 提取（Macro F1 + Exact Match Rate）
+      - 每类意图独立 Precision / Recall / F1 → Macro F1
+      - 多意图集合 Exact Match Rate（子任务集合完全一致的比例）
 
-    用例格式：
-      {"query": "M8多少钱", "sub_tasks": ["PRICE"], "slots": {"model": "M8"}}
+    注意：
+      多意图本质上就是多个单意图的组合，槽位评估意义不大，已移除。
+      测试用例中的 "slots" 字段会被忽略。
+
+    用例格式（旧版 slots 字段可选，会被忽略）：
+      {"query": "M8多少钱", "sub_tasks": ["PRICE"]}
+      {"query": "你好，M9价格多少", "sub_tasks": ["GREETING", "PRICE"]}
 
     不传 cases 时默认加载 tests/test.jsonl。
     """
@@ -787,6 +792,42 @@ async def eval_multi(body: MultiEvalInput):
     evaluator = MultiIntentEvaluator(_engine.planner)
     report, _ = await evaluator.eval(cases, detail=True)
     return evaluator.report_to_dict(report, include_details=True)
+
+
+# ── Bad Case 反馈 ──────────────────────────────────────────────────────────────
+
+class BadCaseReport(BaseModel):
+    """用户反馈的 bad case。"""
+    query: str
+    response: str = ""
+    predicted_sub_tasks: List[str] = []
+    conv_id: str = ""
+    user_id: str = ""
+    note: str = ""  # 用户可选的补充说明
+
+
+_BADCASE_PATH = pathlib.Path(__file__).parent.parent / "data" / "badcase.jsonl"
+
+
+@app.post("/feedback/badcase")
+async def report_badcase(body: BadCaseReport):
+    """
+    用户端 bad case 上报。
+
+    前端用户点"👎"时自动带上 query + 识别结果，追加到 data/badcase.jsonl。
+    定期人工审核后 merge 进 tests/test.jsonl，持续补齐离线评测盲区。
+    """
+    import json, time
+    record = body.model_dump()
+    record["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    record["_source"] = "web_feedback"
+
+    _BADCASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_BADCASE_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    logger.info(f"badcase recorded: query={body.query[:40]!r}")
+    return {"status": "ok"}
 
 
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────

@@ -34,6 +34,7 @@ const api = {
   memEpisodic:  ()                     => api._fetch('GET', '/memory/episodic'),
   memDeleteProfile:  (uid)             => api._fetch('DELETE', '/memory/profile' + (uid ? `?user_id=${encodeURIComponent(uid)}` : '')),
   memDeleteEpisodic: (uid)             => api._fetch('DELETE', '/memory/episodic' + (uid ? `?user_id=${encodeURIComponent(uid)}` : '')),
+  feedbackBadcase:   (data)            => api._fetch('POST', '/feedback/badcase', data),
 };
 
 // 流式对话：返回一个 {meta, tokens[], done} 对象
@@ -122,6 +123,8 @@ const icons = {
   user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
   database: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
   files: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>',
+  thumbsUp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14zM7 22H4a2 2 0 01-2-2v-7a2 2 0 012-2h3"/></svg>',
+  thumbsDown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 15v4a3 3 0 003 3l4-9V2H5.72a2 2 0 00-2 1.7l-1.38 9a2 2 0 002 2.3H10zM17 2h3a2 2 0 012 2v7a2 2 0 01-2 2h-3"/></svg>',
 };
 
 // ── 创建 Vue 应用（模板在 index.html 中）────────────────────────

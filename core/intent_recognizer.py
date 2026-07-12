@@ -28,9 +28,10 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 from anthropic import AsyncAnthropic
+from pydantic import BaseModel, Field, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,67 @@ class PlannerOutput:
             "confidence": self.confidence,
             "reasoning": self.reasoning,
         }
+
+
+# ── LLM 输出校验（Pydantic） ───────────────────────────────────────────────
+
+class _SlotOpLLM(BaseModel):
+    """LLM 输出的单条槽位操作（Pydantic 校验）。"""
+    op: Literal["SET", "DELETE"] = "SET"
+    slot: str = ""
+    value: Any = None
+
+
+class _PlannerLLMResponse(BaseModel):
+    """LLM 输出的完整结构，Pydantic 自动校验类型和范围。
+
+    字段默认值与 PlannerOutput 的预期一致，
+    校验失败时由 validators 静默兜底，不阻断流程。
+    """
+    primary_intent: str = "chitchat"
+    sub_tasks: list[str] = []
+    slot_ops: list[_SlotOpLLM] = []
+    emotion: str = "neutral"
+    confidence: float = Field(default=0.8, ge=0, le=1)
+    reasoning: str = ""
+
+    @classmethod
+    def _valid_intents(cls) -> set:
+        return {c.value for c in IntentCategory}
+
+    @classmethod
+    def _valid_emotions(cls) -> set:
+        return {s.value for s in Sentiment}
+
+    def to_planner_output(self) -> "PlannerOutput":
+        """将 Pydantic 校验结果转为 PlannerOutput（含 SlotOpType 枚举转换）。"""
+        # 意图兜底
+        primary = self.primary_intent
+        if primary not in self._valid_intents():
+            primary = "chitchat"
+
+        # 情绪兜底
+        emotion = self.emotion
+        if emotion not in self._valid_emotions():
+            emotion = "neutral"
+
+        # SlotOp 转换
+        slot_ops = []
+        for op in self.slot_ops:
+            try:
+                op_type = SlotOpType(op.op)
+                slot_ops.append(SlotOp(op=op_type, slot=op.slot, value=op.value))
+            except (ValueError, KeyError):
+                continue
+
+        return PlannerOutput(
+            primary_intent=primary,
+            sub_tasks=list(self.sub_tasks),
+            slot_ops=slot_ops,
+            emotion=emotion,
+            confidence=round(self.confidence, 3),
+            reasoning=self.reasoning,
+        )
 
 
 # ── 向后兼容：保持旧的 IntentResult ──────────────────────────────────────────
@@ -328,68 +390,33 @@ class Planner:
                 logger.warning(f"Planner LLM 重试仍失败，触发降级: {ex2}")
                 return await self._fallback_plan(message, existing_slots)
 
-        # JSON 解析
+        # JSON 解析 + Pydantic 校验
         try:
             s, e = raw.find("{"), raw.rfind("}") + 1
-            data = json.loads(raw[s:e])
-        except Exception as ex:
-            # JSON 格式异常：只传坏输出让 LLM 修正，无需用户上下文
+            parsed = _PlannerLLMResponse.model_validate_json(raw[s:e])
+        except (ValidationError, json.JSONDecodeError, Exception) as ex:
+            # JSON 格式异常或校验失败：只传坏输出让 LLM 修正
             logger.warning(f"Planner JSON 解析失败，让 LLM 修正: {ex}")
             try:
+                # 构造包含 Pydantic 错误详情的修正 prompt
+                fix_prompt = f"修正以下 JSON 格式：\n{raw[s:e]}"
+                if isinstance(ex, ValidationError):
+                    fix_prompt += f"\n\n校验错误：{ex}"
                 resp2 = await self.client.messages.create(
                     model=self.model,
                     max_tokens=512,
                     temperature=0.1,
                     system="你是一个 JSON 修复助手。只输出修正后的合法 JSON，不要代码块、不要额外说明。",
-                    messages=[{"role": "user", "content": f"修正以下 JSON 格式：\n{raw}"}],
+                    messages=[{"role": "user", "content": fix_prompt}],
                 )
-                raw = resp2.content[0].text
-                s, e = raw.find("{"), raw.rfind("}") + 1
-                data = json.loads(raw[s:e])
+                raw2 = resp2.content[0].text
+                s2, e2 = raw2.find("{"), raw2.rfind("}") + 1
+                parsed = _PlannerLLMResponse.model_validate_json(raw2[s2:e2])
             except Exception as ex2:
                 logger.warning(f"Planner JSON 修正仍失败，触发降级: {ex2}")
                 return await self._fallback_plan(message, existing_slots)
 
-        # 解析并校验
-        primary = data.get("primary_intent", IntentCategory.CHITCHAT.value)
-        if isinstance(primary, str):
-            # 验证是否合法的 IntentCategory
-            valid_intents = {c.value for c in IntentCategory}
-            if primary not in valid_intents:
-                primary = IntentCategory.CHITCHAT.value
-
-        sub_tasks = data.get("sub_tasks", [])
-        if not isinstance(sub_tasks, list):
-            sub_tasks = [primary]
-
-        emotion = data.get("emotion", Sentiment.NEUTRAL.value)
-        valid_emotions = {s.value for s in Sentiment}
-        if emotion not in valid_emotions:
-            emotion = Sentiment.NEUTRAL.value
-
-        # 解析 slot_ops
-        slot_ops = []
-        raw_ops = data.get("slot_ops", [])
-        if isinstance(raw_ops, list):
-            for op in raw_ops:
-                try:
-                    op_type = SlotOpType(op.get("op", "SET"))
-                    slot_ops.append(SlotOp(
-                        op=op_type,
-                        slot=str(op.get("slot", "")),
-                        value=op.get("value"),
-                    ))
-                except (ValueError, KeyError):
-                    continue
-
-        return PlannerOutput(
-            primary_intent=primary,
-            sub_tasks=sub_tasks,
-            slot_ops=slot_ops,
-            emotion=emotion,
-            confidence=float(data.get("confidence", 0.8)),
-            reasoning=data.get("reasoning", ""),
-        )
+        return parsed.to_planner_output()
 
     # ── 降级 ──────────────────────────────────────────────────────────────
 

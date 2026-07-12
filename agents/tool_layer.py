@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from agents.skills.base import Tool as SkillTool
+from agents.skill_loader import Tool as SkillTool
 from mcp.knowledge_base import KnowledgeBase
 
 logger = logging.getLogger(__name__)

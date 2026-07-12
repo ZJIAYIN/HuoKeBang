@@ -287,6 +287,68 @@ html, body {
   border: 1px solid rgba(255,255,255,0.08);
 }
 
+/* ── Feedback Buttons ──────────────────────────────────────── */
+.feedback-bar {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 0 4px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.chat-message.ai:hover .feedback-bar {
+  opacity: 0.6;
+}
+
+.feedback-bar:hover {
+  opacity: 1 !important;
+}
+
+.feedback-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.feedback-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.feedback-btn:hover {
+  background: var(--glass-bg);
+  border-color: rgba(255,255,255,0.2);
+}
+
+.feedback-btn.up.active {
+  color: var(--success);
+  border-color: var(--success);
+  background: rgba(52, 211, 153, 0.1);
+  opacity: 1 !important;
+}
+
+.feedback-btn.down.active {
+  color: var(--error);
+  border-color: var(--error);
+  background: rgba(248, 113, 113, 0.1);
+  opacity: 1 !important;
+}
+
+.feedback-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
+
 /* ── Typing Indicator ──────────────────────────────────────── */
 .typing-indicator {
   display: none;

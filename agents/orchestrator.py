@@ -28,8 +28,9 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
+from agents.skill_checks import check_skill
+from agents.skill_loader import Tool
 from agents.skill_registry import SkillRegistry
-from agents.skills.base import Tool
 from agents.slot_manager import SlotOp, SlotManager, SlotOpType
 from agents.tool_layer import ToolLayer
 from agents.lead_store import LeadStore
@@ -96,6 +97,7 @@ class Orchestrator:
         self,
         planner_output: PlannerOutput,
         slot_manager: SlotManager,
+        user_id: str = "",
         memory_context: str = "",
     ) -> ResponseInput:
         """
@@ -105,7 +107,7 @@ class Orchestrator:
           1. 应用 slot_ops → 更新 Slot Manager
           2. 槽位生命周期规则：phone/wechat 变更 → 自动清除关联标记
           3. 构建任务列表：显式 sub_tasks + auto_evaluate 技能
-          4. 遍历任务：can_execute → completed / get_pending_info → pending
+          4. 遍历任务：resolve（灰度路由）→ check_skill → completed / pending
           5. 收集 required_tools → 执行 Tool Layer
           6. 构建 Response Agent 输入
         """
@@ -153,22 +155,24 @@ class Orchestrator:
         all_instructions: List[str] = []
         all_tools: set = set()
 
-        # 3. 统一评估循环
+        # 3. 统一评估循环（新版：灰度路由 + check_skill）
         for task in all_tasks:
-            skill = SkillRegistry.get(task)
-            if skill is None:
+            desc = SkillRegistry.resolve(task, user_id)
+            if desc is None:
                 logger.debug(f"编排: 跳过未知 sub_task={task}")
                 continue
 
-            if skill.can_execute(slots, planner_output.emotion):
+            result = check_skill(
+                desc.name, slots, planner_output.emotion, desc.required_slots
+            )
+            if result["ok"]:
                 completed.append(task)
-                all_instructions.append(skill.instruction)
-                all_tools.update(skill.required_tools)
+                all_instructions.append(desc.instruction)
+                all_tools.update(desc.required_tools)
             else:
-                info = skill.get_pending_info(slots, planner_output.emotion)
-                if info.get("silent"):
+                if result.get("silent"):
                     continue  # 安静跳过，不进 pending
-                pending.append({"skill": task, **info})
+                pending.append({"skill": task, **result})
 
         # 4. 统一执行 Tool Layer
         tool_results: Dict[str, Any] = {}
@@ -416,6 +420,13 @@ class AgentEngine:
         # getattr 保护：LeadStore 连接失败时 _redis 可能未设置
         self._redis_client = getattr(self.lead_store, "_redis", None)
 
+        # ── Skill 初始化：从 .md 文件加载 ──
+        from agents.skill_loader import SkillLoader
+        from agents.skill_registry import SkillRegistry
+
+        loader = SkillLoader()
+        SkillRegistry.init_from_loader(loader)
+
     def _get_slot_manager(self, user_id: str, conv_id: str) -> SlotManager:
         """获取会话级 SlotManager（Redis 后端，跨会话持久化）。"""
         from agents.slot_manager import SlotManager
@@ -460,6 +471,7 @@ class AgentEngine:
         response_input = await self.orchestrator.orchestrate(
             planner_output=planner_output,
             slot_manager=slot_manager,
+            user_id=user_id,
             memory_context=memory_context,
         )
         response_input.user_message = message
@@ -524,6 +536,7 @@ class AgentEngine:
         response_input = await self.orchestrator.orchestrate(
             planner_output=planner_output,
             slot_manager=slot_manager,
+            user_id=user_id,
             memory_context=memory_context,
         )
         response_input.user_message = message
