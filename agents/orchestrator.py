@@ -33,7 +33,6 @@ from agents.skill_loader import Tool
 from agents.skill_registry import SkillRegistry
 from agents.slot_manager import SlotOp, SlotManager, SlotOpType
 from agents.tool_layer import ToolLayer
-from agents.lead_store import LeadStore
 from core.intent_recognizer import Planner, PlannerOutput
 
 logger = logging.getLogger(__name__)
@@ -122,27 +121,7 @@ class Orchestrator:
         ]
         slot_manager.apply(slot_ops)
 
-        # ── 槽位生命周期规则 ──
-        # 当用户给了新手机号时，自动清除所有旧标记。
-        # 不依赖 Planner 发 DELETE，不依赖任何 skill。
-        for op in planner_output.slot_ops:
-            if op.op.value == "SET" and op.slot in ("phone", "wechat"):
-                slot_manager.delete("lead_refused")
-                slot_manager.delete("lead_refused_at")
-
         slots = slot_manager.all
-
-        # ── 手机号格式校验 ──
-        # Planner 可能把 "129870908-8" 这种也当成手机号提取了。
-        # 用正则硬校验，不合法就删掉，让 LeadCapture 自然走 missing 流程。
-        phone = slots.get("phone")
-        if phone is not None:
-            import re as _re
-            digits = _re.sub(r"\D", "", str(phone))
-            if not (len(digits) == 11 and digits.startswith("1")):
-                slot_manager.delete("phone")
-                slots = slot_manager.all  # 刷新
-                logger.warning(f"手机号格式校验不通过，已删除: {phone!r}")
 
         # 2. 构建任务列表：显式 sub_tasks + auto_evaluate 技能
         all_tasks = list(planner_output.sub_tasks)
@@ -414,11 +393,18 @@ class AgentEngine:
         ) if knowledge_base else None
         self.orchestrator = Orchestrator(tool_layer=self.tool_layer)
         self.response_agent = ResponseAgent(client, self.model)
-        self.lead_store = LeadStore(redis_url)
 
         # SlotManager 使用 Redis 后端（跨会话持久化）
-        # getattr 保护：LeadStore 连接失败时 _redis 可能未设置
-        self._redis_client = getattr(self.lead_store, "_redis", None)
+        self._redis_client = None
+        if redis_url:
+            import redis as _redis_module
+            try:
+                _r = _redis_module.from_url(redis_url, decode_responses=True,
+                                            socket_timeout=3, socket_connect_timeout=3)
+                _r.ping()
+                self._redis_client = _r
+            except Exception:
+                logger.warning(f"Redis 不可用: {redis_url}")
 
         # ── Skill 初始化：从 .md 文件加载 ──
         from agents.skill_loader import SkillLoader
@@ -456,10 +442,6 @@ class AgentEngine:
         # 获取会话级 SlotManager
         slot_manager = self._get_slot_manager(user_id, conv_id)
 
-        # 0. 跨会话冷却：Redis TTL 天然跨会话，不需要额外注入逻辑
-        if user_id and self.lead_store.is_in_cooldown(user_id):
-            slot_manager.set("lead_refused", True)
-
         # 1. Planner（理解）
         planner_output = await self.planner.plan(
             message=message,
@@ -475,16 +457,6 @@ class AgentEngine:
             memory_context=memory_context,
         )
         response_input.user_message = message
-
-        # 2.5 留资持久化（Redis） + 拒绝留资记录（Redis TTL）
-        if user_id:
-            slots = slot_manager.all
-            # 收集到留资信息 → 写入 Redis（setex 无 TTL，永久保留）
-            if slots.get("phone") or slots.get("wechat"):
-                self.lead_store.save_lead_from_slots(user_id, slots)
-            # CONTACT_NO 完成 → 写入 Redis 带 24h TTL，自动过期 = 时间窗口
-            if "CONTACT_NO" in response_input.completed:
-                self.lead_store.record_refusal(user_id)
 
         # 3. Response Agent（生成）
         response = await self.response_agent.generate(response_input)
@@ -522,9 +494,6 @@ class AgentEngine:
         t0 = time.monotonic()
         slot_manager = self._get_slot_manager(user_id, conv_id)
 
-        if user_id and self.lead_store.is_in_cooldown(user_id):
-            slot_manager.set("lead_refused", True)
-
         # 1. Planner
         planner_output = await self.planner.plan(
             message=message,
@@ -540,14 +509,6 @@ class AgentEngine:
             memory_context=memory_context,
         )
         response_input.user_message = message
-
-        # 2.5 留资持久化
-        if user_id:
-            slots = slot_manager.all
-            if slots.get("phone") or slots.get("wechat"):
-                self.lead_store.save_lead_from_slots(user_id, slots)
-            if "CONTACT_NO" in response_input.completed:
-                self.lead_store.record_refusal(user_id)
 
         # 先 yield meta（前端需要知道 intent/emotion/skills 用于显示标签）
         meta = {

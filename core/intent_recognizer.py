@@ -41,15 +41,12 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class IntentCategory(Enum):
-    """留资型客服意图（保持向后兼容）"""
+    """留资型客服意图。CONTACT_NO/GIVE/FIX 已废弃，留资由体验券卡片承载。"""
     GREETING      = "greeting"
     PRODUCT_INQ   = "product_inq"
     PRICE_INQ     = "price_inq"
     PURCHASE      = "purchase"
     COMPLAINT     = "complaint"
-    CONTACT_GIVE  = "contact_give"
-    CONTACT_NO    = "contact_no"
-    CONTACT_FIX   = "contact_fix"
     CHITCHAT      = "chitchat"
 
 
@@ -197,12 +194,9 @@ _FEWSHOT = [
     (IntentCategory.PRODUCT_INQ, ["PRODUCT", "PRICE"],      "skeptical", "M8怎么样，贵不贵？", [{"op":"SET","slot":"model","value":"M8"}]),
     (IntentCategory.PRICE_INQ,   ["PRICE"],                 "neutral",   "多少钱一个月？", []),
     (IntentCategory.PRICE_INQ,   ["PRICE", "FINANCE"],      "skeptical", "预算20万，M8能分期吗？", [{"op":"SET","slot":"model","value":"M8"},{"op":"SET","slot":"budget","value":"20万"}]),
-    (IntentCategory.PURCHASE,    ["PURCHASE", "LEAD_CAPTURE"], "positive", "我要买，怎么下单？", []),
+    (IntentCategory.PURCHASE,    ["PURCHASE"],                "positive", "我要买，怎么下单？", []),
     (IntentCategory.COMPLAINT,   ["COMPLAINT"],             "negative",  "等了这么久没人理我", [{"op":"SET","slot":"issue","value":"无人响应"}]),
     (IntentCategory.COMPLAINT,   ["COMPLAINT", "PRICE"],    "skeptical", "你们服务太差了，M8到底多少钱？", [{"op":"SET","slot":"issue","value":"服务差"},{"op":"SET","slot":"model","value":"M8"}]),
-    (IntentCategory.CONTACT_GIVE, ["LEAD_CAPTURE"],         "neutral",   "13712345678", [{"op":"SET","slot":"phone","value":"13712345678"}]),
-    (IntentCategory.CONTACT_GIVE, ["LEAD_CAPTURE"],         "positive",  "我的微信号是abc123", [{"op":"SET","slot":"wechat","value":"abc123"}]),
-    (IntentCategory.CONTACT_NO,  ["CONTACT_NO"],            "neutral",   "不方便留电话", [{"op":"SET","slot":"lead_refused","value":True}]),
     (IntentCategory.CHITCHAT,    ["GREETING"],              "positive",  "今天天气不错", []),
     (IntentCategory.CHITCHAT,    ["WEATHER"],               "neutral",   "北京今天天气怎么样？", [{"op":"SET","slot":"location","value":"北京"}]),
     (IntentCategory.CHITCHAT,    ["WEATHER"],               "neutral",   "明天上海会下雨吗？", [{"op":"SET","slot":"location","value":"上海"}]),
@@ -214,11 +208,8 @@ _INTENT_TO_SUBTASKS: Dict[IntentCategory, List[str]] = {
     IntentCategory.GREETING:      ["GREETING"],
     IntentCategory.PRODUCT_INQ:   ["PRODUCT"],
     IntentCategory.PRICE_INQ:     ["PRICE"],
-    IntentCategory.PURCHASE:      ["PURCHASE", "LEAD_CAPTURE"],
+    IntentCategory.PURCHASE:      ["PURCHASE"],
     IntentCategory.COMPLAINT:     ["COMPLAINT"],
-    IntentCategory.CONTACT_GIVE:  ["LEAD_CAPTURE"],
-    IntentCategory.CONTACT_NO:    ["CONTACT_NO"],
-    IntentCategory.CONTACT_FIX:   ["LEAD_CAPTURE"],
     IntentCategory.CHITCHAT:      ["GREETING", "WEATHER"],
 }
 
@@ -234,7 +225,7 @@ class Planner:
     用法：
         planner = Planner(api_key=..., model=...)
         result = await planner.plan("我想买M8", history=[...])
-        # result.sub_tasks → ["PURCHASE", "LEAD_CAPTURE"]
+        # result.sub_tasks → ["PURCHASE"]
         # result.slot_ops  → [SlotOp(SET, "model", "M8")]
     """
 
@@ -329,23 +320,18 @@ class Planner:
             "  - PRICE           价格咨询",
             "  - FINANCE         金融方案",
             "  - COMPLAINT       投诉/不满",
-            "  - LEAD_CAPTURE    留资/联系方式",
-            "  - CONTACT_NO      拒绝留资",
+            "  - PURCHASE        购买意向",
             "  - WEATHER         查询天气",
             f"- emotion 取值: {', '.join(s.value for s in Sentiment)}",
             "- slot_ops 用 SET 设置提取到的字段，DELETE 删除用户明确取消的字段",
-            "- 常见槽位: model(车型), budget(预算), phone(手机号), wechat(微信号),",
-            "            issue(投诉事由), name(姓名),",
-            "            location(地点/城市),",
-            "            lead_refused(拒绝留资)",
-            "- lead_refused 在用户明确说不留电话/不需要时 SET 为 true",
+            "- 常见槽位: model(车型), budget(预算), issue(投诉事由),",
+            "            location(地点/城市), name(姓名)",
             "- slot 值是用户消息中明确提到的，不要猜、不要编",
             "",
             "=== 注意事项 ===",
             "- 多个意图时，primary_intent 选最核心的那个，其他放 sub_tasks",
             "- 用户报预算但没说要买 → sub_tasks 包含 PRICE、不一定要 PURCHASE",
             '- "滚滚滚"/"骗子"是 negative；"你确定吗"只是 skeptical',
-            "- 手机号必须是 11 位纯数字且以 1 开头才提取 phone 字段，不足 11 位的纯数字不是手机号",
             '- 用户说"算了不要了" → slot_ops 删除相关字段（如 DELETE budget）',
             "",
             "=== 安全约束 ===",

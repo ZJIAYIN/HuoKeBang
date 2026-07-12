@@ -64,12 +64,12 @@
                           │
                      ┌────┴────┐
                      │         │
-                Redis Lua    RabbitMQ
-                DECR 库存   延迟消息(1min)
+                Redis Lua    RabbitMQ（DLQ+TTL）
+                DECR 库存   coupon.delay → coupon.timeout
                      │         │
                      ▼         ▼
               成功 ──→ 弹留资表单 ──→ 用户填 → 锁定券
-                  │                  ├─ 不填 → RMQ 消费 → 释放 + 补偿
+                  │                  ├─ 60s 超时 → DLQ 消费 → 释放 + 补偿
               失败 ──→ "名额已满"
 ```
 
@@ -169,12 +169,46 @@ redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
 return {1, stock}
 ```
 
-### 3.3 RabbitMQ 延迟消息（超时检测）
+### 3.3 RabbitMQ 死信队列（DLQ + TTL）超时检测
 
-**使用场景**：用户点击确认领取后，有 1 分钟时间填写联系方式。
+RabbitMQ 原生不支持延迟消息，通过**死信队列（DLQ）+ TTL** 实现 60s 超时检测。
 
-- 如果 1 分钟内留资 → 锁定券，从 pending 移除
-- 如果 1 分钟超时 → 释放库存 + 通知用户补偿
+**队列拓扑**：
+
+```
+生产者 ──→ coupon.delay（TTL=60s，DLX → coupon.dlx）
+               │ 60s 后消息过期
+               ▼
+         coupon.dlx（死信交换机）
+               │
+               ▼
+         coupon.timeout ←── 消费者监听此队列
+```
+
+**声明代码**：
+
+```python
+# 声明死信交换机
+channel.exchange_declare("coupon.dlx", "direct", durable=True)
+
+# 延迟队列：60s TTL，过期后投递到死信交换机
+channel.queue_declare(
+    "coupon.delay",
+    durable=True,
+    arguments={
+        "x-message-ttl": 60000,
+        "x-dead-letter-exchange": "coupon.dlx",
+        "x-dead-letter-routing-key": "timeout",
+    }
+)
+
+# 实际消费队列
+channel.queue_declare("coupon.timeout", durable=True)
+channel.queue_bind("coupon.timeout", "coupon.dlx", "timeout")
+
+# 消费者：监听 coupon.timeout
+channel.basic_consume("coupon.timeout", handle_coupon_timeout)
+```
 
 **消息结构**：
 
@@ -188,27 +222,38 @@ return {1, stock}
 }
 ```
 
-**消费逻辑**：
+**消费逻辑**（监听 `coupon.timeout` 队列）：
 
 ```python
 def handle_coupon_timeout(ch, method, properties, body):
+    """
+    消息到达此队列说明 60s 已过。
+    检查用户是否已完成留资：
+      - 已留资 → used_set 有记录，跳过
+      - 未留资 → 释放库存 + 补偿通知
+    """
     data = json.loads(body)
     user_id = data["user_id"]
-    now = time.time()
 
-    # 检查用户是否已完成留资
     if redis.sismember("coupon:test_drive:used", user_id):
-        return  # 已留资，不释放
+        ch.basic_ack(method.delivery_tag)
+        return  # 已留资，锁定成功，不释放
 
-    # 检查是否仍在 pending 中且确实超时
-    score = redis.zscore("coupon:test_drive:pending", user_id)
-    if score and score <= now:
-        # 释放库存
-        redis.incr("coupon:test_drive:stock")
-        redis.zrem("coupon:test_drive:pending", user_id)
-        # 发送补偿通知（系统消息推送给用户）
-        notify_compensation(user_id, conv_id)
+    # 释放库存（使用 Lua 脚本保证原子性）
+    redis.incr("coupon:test_drive:stock")
+    redis.zrem("coupon:test_drive:pending", user_id)
+    notify_compensation(user_id, data.get("conv_id", ""))
+    ch.basic_ack(method.delivery_tag)
 ```
+
+**与延迟消息插件的对比**：
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **DLQ + TTL**（本方案） | 零依赖，RabbitMQ 原生支持，docker 镜像不用改 | 每条消息 TTL 固定 |
+| **延迟消息插件** | TTL 可动态指定 | 要装插件，docker 镜像要换 |
+
+本方案选 DLQ + TTL，因为 60s 是固定值，不需要动态 TTL。
 
 ### 3.4 前端券卡片
 
@@ -274,7 +319,7 @@ async def claim_coupon(user_id: str, conv_id: str):
     """
     用户点击确认领取体验券。
     1. Lua 原子扣库存
-    2. 成功 → 入 RMQ 延迟消息
+    2. 成功 → 发消息到 coupon.delay（TTL=60s → 自动转 coupon.timeout）
     3. 返回结果
     """
     script = """
@@ -282,8 +327,12 @@ async def claim_coupon(user_id: str, conv_id: str):
     """
     result = redis.eval(script, ...)
     if result[0] == 1:
-        # 发送延迟消息
-        rmq.send("coupon_timeout", {"user_id": user_id, ...}, delay=60_000)
+        # 发到 coupon.delay 队列，60s 后自动转死信队列 coupon.timeout
+        rmq_channel.basic_publish(
+            exchange='',
+            routing_key='coupon.delay',
+            body=json.dumps({"user_id": user_id, "conv_id": conv_id}),
+        )
         return {"status": "ok", "stock": result[1]}
     else:
         return {"status": "sold_out"}
@@ -330,7 +379,7 @@ async def submit_lead(user_id: str, conv_id: str, phone: str, name: str = ""):
  │                             │  ZADD pending                │                    │
  │                             │ <──────────────────────────  │                    │
  │                             │                              │                    │
- │                             │  RMQ 发送延迟消息(60s)      │                    │
+ │                             │  发消息到 coupon.delay（TTL=60s）             │                    │
  │                             │ ──────────────────────────────────────────────> │
  │                             │                              │                    │
  │  "请填写联系方式"           │                              │                    │
@@ -346,12 +395,13 @@ async def submit_lead(user_id: str, conv_id: str, phone: str, name: str = ""):
  │                             │                              │                    │
  │                             │        ...1min后...           │                    │
  │                             │                              │                    │
- │                             │                              │  RMQ 投递到消费端  │
+ │                             │                              │  coupon.delay 过期 │
+ │                             │                              │  → coupon.timeout │
  │                             │ <────────────────────────────────────────────── │
- │                             │  ZSCORE 发现已留资 → 忽略   │                    │
+ │                             │  SISMEMBER used → 已留资跳过  │                    │
  │                             │                              │                    │
  ──── 如果超时未留资 ────       │                              │                    │
- │                             │  ZSCORE pending → 超时      │                    │
+ │                             │  INCR stock（释放）          │                    │
  │                             │  INCR stock（释放）          │                    │
  │                             │  ZREM pending                │                    │
  │  "名额已释放，下次再试"     │                              │                    │
@@ -452,7 +502,7 @@ redis.setnx("coupon:test_drive:stock", COUPON_CONFIG["test_drive"]["total"])
 | 用户确认后不填表也不关页面 | 倒计时到自动关闭，后台超时检测兜底 |
 | 库存刚好只剩 1 个，多人同时确认 | Lua DECR 原子性保障，不会超卖 |
 | 用户确认后去别处留资再回来填 | RMQ 消费时检查 used 集合，已留资不释放 |
-| RMQ 宕机 | 超时检测降级为定时扫描 Sorted Set，精度降低但功能不丢 |
+| RMQ 宕机 | TTL 无法触发，超时检测降级为定时扫描 Redis Sorted Set，精度降低但功能不丢 |
 | 用户先拒绝（暂不需要）后又想要 | 拒绝标记 24h 冷却，冷却期后重新进入发券决策 |
 | 多个车系多种券 | 未来通过 `coupon:{type}:stock` 扩展 |
 
@@ -464,7 +514,7 @@ redis.setnx("coupon:test_drive:stock", COUPON_CONFIG["test_drive"]["total"])
 |------|------|---------|
 | **P0** | CouponDecider 规则引擎 + Lua 脚本 + `/coupon/claim` | `coupon_decider.py`, `coupon_claim.lua`, `api/main.py` |
 | **P1** | 前端券卡片 + 留资表单 | `chat.js`, `app.js`, `style.css` |
-| **P2** | RabbitMQ 延迟消息 + 消费端 + 超时释放 | `coupon_worker.py`, `docker-compose.yml` |
+| **P2** | RabbitMQ DLQ+TTL 超时检测 + 消费端 | `coupon_worker.py`, `docker-compose.yml` |
 | **P3** | 意图精简 + 废弃 CONTACT_NO/GIVE | `orchestrator.py`, planner prompt |
 | **P4** | 端到端测试 + 库存初始化 + 管理接口 | 测试 + docs |
 

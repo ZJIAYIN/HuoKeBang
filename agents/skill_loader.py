@@ -29,7 +29,6 @@ class Tool(str, Enum):
     CRM = "crm"
     CALCULATOR = "calc"
     WEATHER = "weather"
-    PHONE_VALIDATE = "phone_validate"
 
 
 @dataclass

@@ -42,6 +42,28 @@ services:
       retries: 3
       start_period: 10s
 
+  # ── RabbitMQ 消息队列（体验券超时检测）───────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:4.0-management-alpine
+    container_name: echomind-rabbitmq
+    ports:
+      - "5672:5672"      # AMQP 协议端口
+      - "15672:15672"    # 管理控制台
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-echomind}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-echomind123}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    restart: unless-stopped
+    networks:
+      - echomind-network
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
   # ── EchoMind 主应用 ─────────────────────────────────────────────────────────
   echomind:
     build:
@@ -56,6 +78,7 @@ services:
     environment:
       # 容器内固定值，覆盖 .env 中的本地路径
       - REDIS_URL=redis://:${REDIS_PASSWORD:-echomind123}@redis:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-echomind}:${RABBITMQ_PASS:-echomind123}@rabbitmq:5672/
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
     volumes:
@@ -65,6 +88,8 @@ services:
       redis:
         condition: service_healthy
       chromadb:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -110,4 +135,5 @@ networks:
 volumes:
   redis-data:
   chromadb-data:
+  rabbitmq-data:
   nginx-logs:

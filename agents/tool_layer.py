@@ -114,9 +114,6 @@ class ToolLayer:
         if SkillTool.WEATHER in required_tools:
             results["weather"] = await self.exec_weather(slots)
 
-        if SkillTool.PHONE_VALIDATE in required_tools:
-            results["phone_validate"] = self.validate_phone(slots)
-
         # 预留：if SkillTool.CRM in required_tools: ...
         # 预留：if SkillTool.CALCULATOR in required_tools: ...
 
@@ -279,28 +276,6 @@ class ToolLayer:
             parts.append(issue)
 
         return " ".join(parts)
-
-    # ── 手机号校验 ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def validate_phone(slots: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        校验手机号格式。中国手机号规则：11 位纯数字，以 1 开头。
-        返回 {"valid": bool, "raw": str, "message": str}
-        """
-        import re
-        phone = slots.get("phone", "")
-        if not phone:
-            return {"valid": True, "raw": "", "message": "无手机号"}
-
-        digits_only = re.sub(r"\D", "", str(phone))
-        if len(digits_only) == 11 and digits_only.startswith("1"):
-            return {"valid": True, "raw": digits_only, "message": "格式正确"}
-        return {
-            "valid": False,
-            "raw": str(phone),
-            "message": f"手机号格式错误（需 11 位纯数字，以 1 开头）：{phone}",
-        }
 
     # ── 统计 ──────────────────────────────────────────────────────────────
 

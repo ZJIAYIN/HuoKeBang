@@ -76,8 +76,6 @@ INTENT_KEYWORDS: Dict[str, List[str]] = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SLOT_PATTERNS: Dict[str, re.Pattern] = {
-    "phone":    re.compile(r"(1[3-9]\d{9})"),
-    "wechat":   re.compile(r"(?:微信|wechat|vx|VX|wx|WX)[：:\s]*([a-zA-Z0-9_-]{6,20})"),
     "model":    re.compile(r"(?:问界\s*)?(M\d{1,2})"),
     "budget":   re.compile(r"(\d+(?:\.\d+)?)\s*万"),
     "location": re.compile(r"(北京|上海|广州|深圳|杭州|成都|武汉|南京|重庆|"
@@ -102,11 +100,8 @@ _INTENT_TO_SUBTASKS: Dict[str, List[str]] = {
     "greeting":      ["GREETING"],
     "product_inq":   ["PRODUCT"],
     "price_inq":     ["PRICE"],
-    "purchase":      ["PURCHASE", "LEAD_CAPTURE"],
+    "purchase":      ["PURCHASE"],
     "complaint":     ["COMPLAINT"],
-    "contact_give":  ["LEAD_CAPTURE"],
-    "contact_no":    ["CONTACT_NO"],
-    "contact_fix":   ["LEAD_CAPTURE"],
     "chitchat":      ["GREETING", "WEATHER"],
 }
 
@@ -180,7 +175,7 @@ class PlannerFallback:
             heuristic_intent = self._heuristic_fallback(message, slot_names)
             if heuristic_intent:
                 best_intent = heuristic_intent
-                # 重新提取槽位（intent 变了可能影响 lead_refused 等标记）
+                # 重新提取槽位（intent 变了可能影响槽位提取结果）
                 slot_ops = self._extract_slots(message, best_intent)
             else:
                 # 语义和启发式都拿不准 → 安全兜底，引导用户说清楚
@@ -291,7 +286,7 @@ class PlannerFallback:
     def _extract_slots(self, message: str, intent: str) -> List[Any]:
         """用正则表达式提取槽位信息。
 
-        支持：手机号、微信号、车型、预算、地点、投诉事由、拒绝留资标记。
+        支持：车型、预算、地点、投诉事由。
 
         Args:
             message: 用户消息
@@ -303,18 +298,6 @@ class PlannerFallback:
         from core.intent_recognizer import SlotOp, SlotOpType
 
         slot_ops = []
-
-        # 手机号：校验 11 位且以 1 开头
-        m = SLOT_PATTERNS["phone"].search(message)
-        if m:
-            digits = re.sub(r"\D", "", m.group(1))
-            if len(digits) == 11 and digits.startswith("1"):
-                slot_ops.append(SlotOp(op=SlotOpType.SET, slot="phone", value=digits))
-
-        # 微信号
-        m = SLOT_PATTERNS["wechat"].search(message)
-        if m:
-            slot_ops.append(SlotOp(op=SlotOpType.SET, slot="wechat", value=m.group(1)))
 
         # 车型
         m = SLOT_PATTERNS["model"].search(message)
@@ -336,10 +319,6 @@ class PlannerFallback:
         if m:
             slot_ops.append(SlotOp(op=SlotOpType.SET, slot="issue", value=m.group(0)))
 
-        # 拒绝留资：intent 判定为 contact_no 时自动标记
-        if intent == "contact_no":
-            slot_ops.append(SlotOp(op=SlotOpType.SET, slot="lead_refused", value=True))
-
         return slot_ops
 
     # ── 辅助 ──────────────────────────────────────────────────────────────
@@ -357,14 +336,6 @@ class PlannerFallback:
         Returns:
             预测的 intent 字符串，无法判断时返回 None
         """
-        # 手机号 → contact_give
-        if "phone" in slot_names:
-            return "contact_give"
-
-        # 微信号 → contact_give
-        if "wechat" in slot_names:
-            return "contact_give"
-
         # 纯问候（短消息 + 无业务关键词）
         msg = message.strip()
         if len(msg) <= 6 and any(kw in msg for kw in ["你好", "嗨", "hi", "hello", "在吗"]):
