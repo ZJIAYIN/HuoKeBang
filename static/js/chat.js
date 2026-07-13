@@ -19,6 +19,21 @@ const ChatView = {
     // 用户 & 会话管理
     const userId = ref(localStorage.getItem('echomind_user_id') || ('user_' + Date.now().toString(36)));
 
+    // 体验券状态
+    const couponCard = reactive({
+      visible: false,
+      msgIdx: -1,
+      claimed: false,
+      showForm: false,
+      countdown: 60,
+      timerId: null,
+    });
+    const leadForm = reactive({
+      name: '',
+      phone: '',
+      submitting: false,
+    });
+
     const { $api, $toast, $icons, $chatStream } = Vue.getCurrentInstance().appContext.config.globalProperties;
     const nextTick = Vue.nextTick;
 
@@ -31,7 +46,107 @@ const ChatView = {
       localStorage.setItem('echomind_user_id', userId.value);
     }
 
-    // ── 自动调整 textarea 高度 ─────────────────────────────
+    // ── 显示体验券卡片（由后端 show_coupon 字段控制）──────
+    function showCouponCard(msgIdx) {
+      couponCard.visible = true;
+      couponCard.msgIdx = msgIdx;
+      // 清理旧定时器
+      if (couponCard.timerId) {
+        clearInterval(couponCard.timerId);
+        couponCard.timerId = null;
+      }
+      couponCard.claimed = false;
+      couponCard.showForm = false;
+      couponCard.countdown = 60;
+      leadForm.name = '';
+      leadForm.phone = '';
+    }
+
+    // ── 领取体验券 ───────────────────────────────────
+    async function claimCoupon() {
+      try {
+        const result = await $api.claimCoupon(userId.value, convId.value);
+        if (result.status === 'ok') {
+          couponCard.claimed = true;
+          couponCard.showForm = true;
+          startCountdown();
+          $toast('success', '🎉 已领取体验券！请在 60s 内填写留资信息');
+        } else if (result.status === 'duplicate') {
+          couponCard.claimed = true;
+          couponCard.showForm = true;
+          startCountdown();
+          $toast('info', '您已领取过体验券，请填写留资信息');
+        } else if (result.status === 'sold_out') {
+          $toast('error', '体验券已发放完毕');
+          couponCard.visible = false;
+        } else if (result.status === 'cooldown') {
+          $toast('info', '24h 冷却中，暂无法领取');
+          couponCard.visible = false;
+        } else {
+          $toast('error', result.message || '领取失败');
+        }
+      } catch (err) {
+        $toast('error', `领取失败: ${err.message}`);
+      }
+    }
+
+    // ── 关闭体验券 ───────────────────────────────────
+    function dismissCoupon() {
+      if (couponCard.timerId) {
+        clearInterval(couponCard.timerId);
+        couponCard.timerId = null;
+      }
+      couponCard.visible = false;
+      couponCard.showForm = false;
+      couponCard.claimed = false;
+      $toast('info', '已关闭体验券');
+    }
+
+    // ── 倒计时 ───────────────────────────────────────
+    function startCountdown() {
+      if (couponCard.timerId) clearInterval(couponCard.timerId);
+      couponCard.countdown = 60;
+      couponCard.timerId = setInterval(() => {
+        couponCard.countdown--;
+        if (couponCard.countdown <= 0) {
+          clearInterval(couponCard.timerId);
+          couponCard.timerId = null;
+          couponCard.showForm = false;
+          couponCard.visible = false;
+          couponCard.claimed = false;
+          $toast('warning', '⏰ 表单填写超时，体验券已释放');
+        }
+      }, 1000);
+    }
+
+    // ── 提交留资表单 ─────────────────────────────────
+    async function submitLeadForm() {
+      const name = leadForm.name.trim();
+      const phone = leadForm.phone.trim();
+      if (!name) { $toast('error', '请输入姓名'); return; }
+      if (!phone) { $toast('error', '请输入手机号'); return; }
+      if (!/^1\d{10}$/.test(phone)) { $toast('error', '请输入正确的 11 位手机号'); return; }
+
+      leadForm.submitting = true;
+      try {
+        const result = await $api.submitCouponLead(userId.value, name, phone, convId.value);
+        if (result.status === 'ok') {
+          $toast('success', '✅ 试驾体验券已锁定！工作人员将尽快联系您');
+          if (couponCard.timerId) {
+            clearInterval(couponCard.timerId);
+            couponCard.timerId = null;
+          }
+          couponCard.showForm = false;
+          couponCard.visible = false;
+        } else {
+          $toast('error', result.message || '提交失败');
+        }
+      } catch (err) {
+        $toast('error', `提交失败: ${err.message}`);
+      } finally {
+        leadForm.submitting = false;
+      }
+    }
     function autoResize(el) {
       el.style.height = 'auto';
       el.style.height = Math.min(el.scrollHeight, 150) + 'px';
@@ -86,6 +201,7 @@ const ChatView = {
             fullResponse = d.response;
             messages[msgIdx].content = fullResponse;
           }
+          if (d.show_coupon) showCouponCard(msgIdx);
           const sks = (d.skill_statuses || []).filter(s => s.status === 'success').map(s => s.name);
           const metaObj = {
             intent:     d.primary_intent || streamMeta?.primary_intent || '',
@@ -130,6 +246,7 @@ const ChatView = {
           messages[msgIdx].content = data.response;
           messages[msgIdx].meta = metaObj;
           currentMsg.value = metaObj;
+          if (data.show_coupon) showCouponCard(msgIdx);
         } catch (err) {
           error.value = err.message;
           $toast('error', `请求失败: ${err.message}`);
@@ -206,6 +323,7 @@ const ChatView = {
       sendMessage, newConversation, handleKeydown, autoResize,
       setUserId, $icons,
       feedbackState, reportBadCase, goodFeedback,
+      couponCard, leadForm, claimCoupon, dismissCoupon, submitLeadForm, startCountdown,
     };
   },
 
@@ -242,6 +360,42 @@ const ChatView = {
         <template v-for="(msg, i) in messages" :key="i">
           <div :class="['chat-message', msg.role]">
             <div class="message-bubble">{{ msg.content }}<span v-if="msg.role === 'ai' && streaming && i === messages.length - 1" class="stream-cursor">▌</span></div>
+            <!-- 体验券卡片（在 AI 回复末尾展示） -->
+            <div v-if="msg.role === 'ai' && couponCard.visible && couponCard.msgIdx === i && !couponCard.showForm" class="coupon-card glass-sm">
+              <div class="coupon-card-header">
+                <span v-html="$icons.gift" class="coupon-icon"></span>
+                <div>
+                  <div class="coupon-title">🎁 试驾体验券</div>
+                  <div class="coupon-desc">到店试驾即可获得专属礼品，赶快领取吧！</div>
+                </div>
+              </div>
+              <div class="coupon-card-actions">
+                <button class="btn btn-primary btn-sm" @click="claimCoupon" :disabled="loading">
+                  确认领取
+                </button>
+                <button class="btn btn-secondary btn-sm" @click="dismissCoupon">
+                  暂不需要
+                </button>
+              </div>
+            </div>
+            <!-- 留资表单（领取后弹出） -->
+            <div v-if="msg.role === 'ai' && couponCard.visible && couponCard.showForm && couponCard.msgIdx === i" class="lead-form glass-sm">
+              <div class="lead-form-header">
+                <span v-html="$icons.gift" class="coupon-icon"></span>
+                <span class="coupon-title">填写信息锁定体验券</span>
+                <span class="lead-countdown" :class="{ urgent: couponCard.countdown <= 15 }">
+                  {{ couponCard.countdown }}s
+                </span>
+              </div>
+              <div class="lead-form-body">
+                <input v-model="leadForm.name" placeholder="您的姓名" class="lead-input" maxlength="20" :disabled="leadForm.submitting" />
+                <input v-model="leadForm.phone" placeholder="手机号" class="lead-input" maxlength="11" :disabled="leadForm.submitting" />
+                <button class="btn btn-primary btn-sm lead-submit" @click="submitLeadForm" :disabled="leadForm.submitting">
+                  <span v-if="leadForm.submitting" v-html="$icons.loader"></span>
+                  <span v-else>提交</span>
+                </button>
+              </div>
+            </div>
             <div v-if="msg.meta && !(streaming && i === messages.length - 1)" class="message-meta">
               <span v-if="msg.meta.intent && msg.meta.intent !== 'error'" class="meta-tag intent">{{ msg.meta.intent }}</span>
               <span v-if="msg.meta.emotion && msg.meta.emotion !== 'error'" class="meta-tag emotion">{{ msg.meta.emotion }}</span>

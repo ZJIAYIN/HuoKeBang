@@ -39,6 +39,11 @@ logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# 抑制第三方库调试日志（心跳包等）
+for _noisy in ("aiormq", "pamqp", "aio_pika"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 BANNER = r"""
@@ -62,6 +67,18 @@ _rate_limiter = None  # 限流组件（包含令牌桶 + 用户频控 + 去重�
 _redis_dedup  = None
 _UPLOAD_DEDUP_KEY = "echomind:upload_doc_ids"
 
+# 体验券系统
+_coupon_manager = None
+_coupon_decider = None
+
+# MySQL 持久化 + Outbox 扫描
+_coupon_db = None
+_outbox_scanner = None
+
+# RabbitMQ + 后台 Worker
+_rmq_client = None
+_coupon_worker = None
+
 
 API_KEY = "sk-92f09f3ada494ecd8390763ff293906b"
 BASE_URL = "https://api.deepseek.com/anthropic"
@@ -71,12 +88,13 @@ MODEL = "deepseek-chat"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _engine, _memory, _kb, _detector, _redis_dedup, _rate_limiter, _work_queue
+    global _coupon_manager, _coupon_decider, _coupon_db, _outbox_scanner
+    global _rmq_client, _coupon_worker
 
     print(BANNER, flush=True)
 
     from agents.orchestrator import AgentEngine
     from mcp.knowledge_base import KnowledgeBase
-    from memory.conversation_memory import MemoryManager
 
     logger.info(f"模型: {MODEL}  base_url: {BASE_URL}")
 
@@ -96,15 +114,10 @@ async def lifespan(app: FastAPI):
     )
     logger.info(f"知识库已加载: {_kb.doc_count} 个文档片段")
 
-    # ── 新架构引擎 ────────────────────────────────────────────────────
-    _engine = AgentEngine(
-        knowledge_base=_kb,
-        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
-    )
-
-    # ── 记忆管理器 ────────────────────────────────────────────────────
+    # ── 记忆管理器（提前初始化，后续 coupon 系统依赖） ──────────────
+    from memory.conversation_memory import MemoryManager
     _memory = MemoryManager(
-        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
+        redis_url=redis_url,
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
@@ -112,6 +125,71 @@ async def lifespan(app: FastAPI):
         base_url=BASE_URL,
         model=MODEL,
     )
+
+    # ── MySQL 连接池（体验券持久化） ──────────────────────────────
+    from agents.coupon_db import CouponDB
+    _coupon_db = CouponDB()
+    db_ok = await _coupon_db.connect()
+    if not db_ok:
+        logger.warning("MySQL 不可用，体验券持久化降级为纯 Redis 模式")
+
+    # ── 体验券系统（CouponManager + CouponDecider） ──────────────────
+    from agents.coupon_manager import CouponManager
+    from agents.coupon_decider import CouponDecider
+
+    _coupon_redis = _redis_dedup  # 复用 Redis 连接
+    if _coupon_redis is not None:
+        _coupon_manager = CouponManager(
+            redis_client=_coupon_redis,
+            coupon_db=_coupon_db if db_ok else None,
+        )
+        _coupon_manager.load_scripts()
+        await _coupon_manager.init_stock()
+        _coupon_decider = CouponDecider()
+        logger.info("体验券系统已初始化（CouponManager + CouponDecider）")
+    else:
+        logger.warning("Redis 不可用，体验券系统已禁用")
+        _coupon_decider = CouponDecider()
+        _coupon_decider.disable()
+
+    # ── 新架构引擎（传入 coupon_decider） ────────────────────────────
+    _engine = AgentEngine(
+        knowledge_base=_kb,
+        redis_url=redis_url,
+        coupon_decider=_coupon_decider,
+    )
+
+    # ── RabbitMQ + CouponWorker + OutboxScanner ──────────────────
+    from agents.rmq_client import RmqClient
+    from agents.coupon_worker import CouponWorker
+    from agents.outbox_scanner import OutboxScanner
+
+    _rmq_client = RmqClient()
+    rmq_ok = await _rmq_client.connect()
+    if rmq_ok and _coupon_manager is not None:
+        # CouponWorker — 消费 DLQ 超时消息
+        _coupon_worker = CouponWorker(
+            coupon_manager=_coupon_manager,
+            coupon_db=_coupon_db if db_ok else None,
+            memory_manager=_memory,
+        )
+        _coupon_worker.start(_rmq_client)
+        logger.info("CouponWorker 已启动（体验券超时检测）")
+
+        # OutboxScanner — 扫描 coupon_outbox 发 RMQ
+        if db_ok:
+            _outbox_scanner = OutboxScanner(
+                coupon_db=_coupon_db,
+                rmq_client=_rmq_client,
+            )
+            _outbox_scanner.start()
+            logger.info("OutboxScanner 已启动（体验券消息表扫描）")
+        else:
+            logger.warning("MySQL 不可用，OutboxScanner 已跳过")
+    else:
+        logger.warning(
+            f"RabbitMQ 不可用（conn={rmq_ok}），体验券超时释放功能降级"
+        )
 
     # ── 注入检测器（基于向量相似度的 Prompt Injection 检测） ──────────────
     from security.injection_detector import InjectionDetector
@@ -134,6 +212,15 @@ async def lifespan(app: FastAPI):
     logger.info("EchoMind v2（新架构）已就绪")
     yield
 
+    # ── 关闭后台组件 ──────────────────────────────────────────────
+    if _outbox_scanner is not None:
+        await _outbox_scanner.stop()
+    if _coupon_worker is not None:
+        await _coupon_worker.stop()
+    if _rmq_client is not None:
+        await _rmq_client.close()
+    if _coupon_db is not None:
+        await _coupon_db.close()
     logger.info("EchoMind 已关闭")
 
 
@@ -179,6 +266,7 @@ class ChatResponse(BaseModel):
     skill_statuses:  List[Dict[str, Any]]
     knowledge_used:  bool
     latency_ms:      float
+    show_coupon:     bool = False
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -310,6 +398,7 @@ async def chat(req: ChatRequest):
         ],
         knowledge_used=result.need_rag,
         latency_ms=round(result.latency_ms, 1),
+        show_coupon=result.show_coupon,
     )
 
 
@@ -459,6 +548,133 @@ def _append_intent_log(message: str, primary_intent: str,
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as ex:
         logger.warning(f"写入 intent 日志失败: {ex}")
+
+
+# ── 体验券路由 ──────────────────────────────────────────────────────────────────
+
+class CouponClaimInput(BaseModel):
+    user_id: str = Field(..., min_length=1, description="用户 ID")
+    conv_id: str = Field(..., min_length=1, description="会话 ID")
+
+
+class CouponLeadInput(BaseModel):
+    user_id: str = Field(..., min_length=1, description="用户 ID")
+    name:    str = Field(..., min_length=1, max_length=50, description="姓名")
+    phone:   str = Field(..., min_length=7, max_length=20, description="手机号")
+    conv_id: str = Field(..., min_length=1, description="会话 ID")
+
+
+@app.post("/coupon/claim", tags=["体验券"])
+async def coupon_claim(body: CouponClaimInput):
+    """
+    用户确认领取体验券。
+
+    原子操作：检查库存 → 扣减 → 写 pending。
+    支持幂等：同一用户重复调用不重复扣减。
+    """
+    if _coupon_manager is None:
+        raise HTTPException(503, "体验券系统未初始化")
+
+    # # 检查冷却
+    # if _coupon_manager.check_cooldown(body.user_id):
+    #     return {"status": "cooldown", "message": "24h 冷却中", "stock": _coupon_manager.get_stock()}
+
+    result = await _coupon_manager.claim(body.user_id, body.conv_id)
+
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("message", "领取失败"))
+
+    return result
+
+
+@app.post("/coupon/lead", tags=["体验券"])
+async def coupon_lead(body: CouponLeadInput):
+    """
+    用户提交留资表单。
+
+    锁定体验券（释放时不再归还库存），记录留资信息。
+    同时写入 MySQL（持久化）和 Redis（缓存）。
+    """
+    if _coupon_manager is None:
+        raise HTTPException(503, "体验券系统未初始化")
+
+    # 检查是否有 claimed 记录
+    if not _coupon_manager.check_claimed(body.user_id):
+        raise HTTPException(400, "无待处理的体验券，请先领取")
+
+    user_id = body.user_id
+    name = body.name
+    phone = body.phone
+    conv_id = body.conv_id
+
+    # ── 1. 写入 MySQL（持久化） ──────────────────────────
+    order_id = 0
+    if _coupon_db and _coupon_db.connected:
+        try:
+            # 查找用户的订单
+            order = await _coupon_db.find_order_by_user_id(user_id)
+            if order:
+                order_id = order["id"]
+                # 插入 lead 记录
+                await _coupon_db.insert_lead(
+                    order_id=order_id,
+                    user_id=user_id,
+                    name=name,
+                    phone=phone,
+                    conv_id=conv_id,
+                )
+                # 更新订单状态
+                await _coupon_db.update_order_status(order_id, "lead_submitted")
+                logger.info(
+                    f"MySQL 留资已保存: order_id={order_id} user={user_id}"
+                )
+        except Exception as ex:
+            logger.error(f"MySQL 留资写入失败: {ex}")
+            # 不阻断流程，Redis 缓存仍可工作
+
+    # ── 2. 写入 Redis（缓存） ────────────────────────────
+    lead_data = body.model_dump_json()
+    ok = _coupon_manager.set_lead_submitted(user_id, lead_data)
+    if not ok:
+        raise HTTPException(500, "留资保存失败")
+
+    logger.info(
+        f"留资提交成功: user={user_id} name={name} "
+        f"phone={phone[-4:]} order_id={order_id}"
+    )
+
+    return {
+        "status": "ok",
+        "message": "试驾体验券已锁定，感谢您的参与！",
+        "stock": _coupon_manager.get_stock(),
+    }
+
+
+@app.get("/coupon/stats", tags=["体验券"])
+async def coupon_stats():
+    """体验券系统统计（库存/领取/留资数）。"""
+    if _coupon_manager is None:
+        raise HTTPException(503, "体验券系统未初始化")
+    return _coupon_manager.stats()
+
+
+@app.get("/coupon/check", tags=["体验券"])
+async def coupon_check(user_id: str = "", conv_id: str = ""):
+    """
+    检查用户是否可以领取体验券（供前端预检）。
+
+    返回冷却状态、pending 状态、库存余量。
+    """
+    if _coupon_manager is None:
+        raise HTTPException(503, "体验券系统未初始化")
+
+    return {
+        "claimed": _coupon_manager.check_claimed(user_id) if user_id else False,
+        "pending": _coupon_manager.check_pending(user_id) if user_id else False,
+        "cooldown": _coupon_manager.check_cooldown(user_id) if user_id else False,
+        "lead_submitted": _coupon_manager.check_lead_submitted(user_id) if user_id else False,
+        "stock": _coupon_manager.get_stock(),
+    }
 
 
 # ── 其余路由 ──────────────────────────────────────────────────────────────────

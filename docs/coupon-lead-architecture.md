@@ -259,20 +259,19 @@ def handle_coupon_timeout(ch, method, properties, body):
 
 **位置**：`chat.js` 中的新组件（或内联模板）
 
-**渲染条件**：AI 回复中检测到特殊标记（而非依赖意图识别）
+**渲染条件**：后端 `show_coupon` 布尔字段（通过 stream done event 或 ChatResponse 传递）
 
-**两种方式**：
+**实现方式**：
 
-| 方式 | 实现 | 优缺点 |
-|------|------|--------|
-| **标记位** | Response Agent 在回复末尾加 `[COUPON_CARD]`，前端解析渲染 | 不改 LLM 输出结构，纯前端逻辑 |
-| **结构化 meta** | stream meta 中将 `coupon` 字段设为 `true`，前端按约定渲染 | 依赖 meta 传递 |
+| 方式 | 实现 | 说明 |
+|------|------|------|
+| **结构化字段** | Orchestrator 中 CouponDecider 决策后，在 stream `done` event 或 ChatResponse 中携带 `show_coupon: true/false` | 不依赖 LLM 输出文本，前端直接消费布尔值 |
 
-**推荐标记位方式**（改动最小）：
+**实现**（前端 `chat.js`）：
 
 ```html
 <!-- 在 message-bubble 之后 -->
-<div v-if="msg.role === 'ai' && msg.content.includes('[COUPON_CARD]')" class="coupon-card">
+<div v-if="msg.role === 'ai' && couponCard.visible && couponCard.msgIdx === i && !couponCard.showForm" class="coupon-card glass-sm">
   <div class="coupon-card-body">
     <div class="coupon-icon">🎉</div>
     <div class="coupon-title">到店试驾体验券</div>

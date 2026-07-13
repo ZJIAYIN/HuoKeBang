@@ -35,6 +35,10 @@ const api = {
   memDeleteProfile:  (uid)             => api._fetch('DELETE', '/memory/profile' + (uid ? `?user_id=${encodeURIComponent(uid)}` : '')),
   memDeleteEpisodic: (uid)             => api._fetch('DELETE', '/memory/episodic' + (uid ? `?user_id=${encodeURIComponent(uid)}` : '')),
   feedbackBadcase:   (data)            => api._fetch('POST', '/feedback/badcase', data),
+  claimCoupon:       (uid, cid)        => api._fetch('POST', '/coupon/claim', { user_id: uid, conv_id: cid }),
+  submitCouponLead:  (uid, name, phone, cid) => api._fetch('POST', '/coupon/lead', { user_id: uid, name, phone, conv_id: cid }),
+  couponStats:       ()                => api._fetch('GET', '/coupon/stats'),
+  couponCheck:       (uid)             => api._fetch('GET', `/coupon/check?user_id=${encodeURIComponent(uid)}`),
 };
 
 // 流式对话：返回一个 {meta, tokens[], done} 对象
@@ -125,6 +129,8 @@ const icons = {
   files: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>',
   thumbsUp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14zM7 22H4a2 2 0 01-2-2v-7a2 2 0 012-2h3"/></svg>',
   thumbsDown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 15v4a3 3 0 003 3l4-9V2H5.72a2 2 0 00-2 1.7l-1.38 9a2 2 0 002 2.3H10zM17 2h3a2 2 0 012 2v7a2 2 0 01-2 2h-3"/></svg>',
+  gift: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2v-6"/><path d="M22 7H2v5h20V7z"/><path d="M12 22V7"/><path d="M12 7H7.5a2.5 2.5 0 010-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 000-5C13 2 12 7 12 7z"/></svg>',
+  clockAlert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/><path d="M12 18h.01"/></svg>',
 };
 
 // ── 创建 Vue 应用（模板在 index.html 中）────────────────────────

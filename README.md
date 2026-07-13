@@ -439,6 +439,63 @@ Redis 天然跨会话，TTL 过期自动解除冷却
 
 ---
 
+## 对话式体验券系统
+
+> **对应的文件：** `agents/coupon_decider.py` + `agents/coupon_manager.py` + `agents/coupon_worker.py` + `agents/rmq_client.py`
+
+在对话中自动判断发券时机，引导用户领取试驾体验券并填写留资表单。
+
+### 交互流程
+
+```
+后端响应含 show_coupon=true 字段
+    ↓
+前端解析 → 渲染券卡片
+    │
+    ├─ [确认领取] → POST /coupon/claim（原子扣库存）
+    │                   ↓ 成功
+    │              弹留资浮层（60s 倒计时）
+    │                   │
+    │           ┌───────┴──────────┐
+    │      用户填表提交        倒计时结束
+    │           │                   │
+    │     POST /coupon/lead     自动关闭浮层
+    │     锁定成功消息          CouponWorker 释放
+    │
+    └─ [暂不需要] → 隐藏卡片
+```
+
+### 触发规则（CouponDecider）
+
+| 条件 | 值 | 说明 |
+|------|-----|------|
+| 对话轮数 | > 5 轮 | 用户已进行有意义的对话 |
+| 用户意图 | 含 PRICE 或 PRODUCT | 表现出购买意向 |
+| 用户情绪 | positive / neutral | 情绪好时转化率高 |
+
+### 原子库存管理
+
+- **Lua 脚本**保证 Redis 库存扣减 + 幂等检查原子性
+- **CouponManager** 封装所有库存/状态操作
+- **24h 冷却**：领取后 24h 内不重复发券
+
+### 超时释放（RabbitMQ DLQ）
+
+```
+CouponManager.claim() 成功
+    ↓
+发消息到 coupon.delay 队列（TTL=60s）
+    ↓ 到期
+死信转发到 coupon.timeout
+    ↓
+CouponWorker 消费 → Lua release 脚本
+    ↓ 已留资？
+    ├─ 是 → 跳过释放
+    └─ 否 → 归还库存 + 补偿通知
+```
+
+---
+
 ## 记忆系统（三级架构）
 
 > **对应的文件：** `memory/conversation_memory.py`
@@ -671,6 +728,10 @@ RRF_score(d) = Σ 1 / (K + rank_r(d))
 | `/knowledge/list` | GET | 知识库片段列表 |
 | `/knowledge/{doc_id}` | DELETE | 按文档 ID 删除 |
 | `/knowledge` | DELETE | 清空知识库 |
+| `/coupon/claim` | POST | 用户确认领取体验券（原子扣库存 + 幂等检查） |
+| `/coupon/lead` | POST | 用户提交留资表单，锁定体验券 |
+| `/coupon/stats` | GET | 体验券系统统计（库存 / 领取 / 留资数） |
+| `/coupon/check` | GET | 检查用户是否可以领取体验券（预检） |
 | `/memory/profiles` | GET | 用户画像列表 |
 | `/memory/episodic` | GET | 情景记忆列表 |
 | `/eval/run` | POST | 运行旧架构端到端评测 |
@@ -696,9 +757,15 @@ RRF_score(d) = Σ 1 / (K + rank_r(d))
               ┌──────────┘   │   └──────────┐
               ▼              ▼              ▼
         ┌─────────┐   ┌──────────┐   ┌──────────────┐
-        │  Redis  │   │ ChromaDB │   │  Prometheus  │
-        │ 工作记忆│   │向量数据库 │   │   指标采集    │
-        │ (TTL 24h)│   │情景+画像  │   │   :9091      │
+        │  Redis  │   │ ChromaDB │   │  RabbitMQ  │
+        │ 工作记忆  │   │DLQ/TTL   │   │   指标采集    │
+        │ 库存/券  │   │超时释放    │   │   :9091      │
+        └─────────┘   └──────────┘   └──────┬───────┘
+                                             │
+                                        ┌────▼──────┐
+                                        │CouponWorker│
+                                        │ 消费者     │
+                                        └───────────┘
         └─────────┘   └──────────┘   └──────────────┘
 ```
 
@@ -708,6 +775,7 @@ RRF_score(d) = Σ 1 / (K + rank_r(d))
 |------|------|
 | `redis` | Redis 7，AOF 持久化，Password 认证 |
 | `chromadb` | 向量数据库（docker-compose.dev.yml 中独立） |
+| `rabbitmq` | 消息队列（体验券 TTL 超时检测 + DLQ 自动释放） |
 | `prometheus` | 指标采集与告警 |
 | `echomind` | 主应用，FastAPI + Uvicorn |
 | `nginx` | 反向代理 + 限流（10r/s）+ Gzip |

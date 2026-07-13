@@ -42,6 +42,34 @@ services:
       retries: 3
       start_period: 10s
 
+  # ── MySQL 数据库（体验券持久化 + Outbox 模式）────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: echomind-mysql
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: echomind
+      MYSQL_USER: ${MYSQL_USER:-echomind}
+      MYSQL_PASSWORD: ${MYSQL_PASS:-echomind123}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql/init_coupon.sql:/docker-entrypoint-initdb.d/01_init_coupon.sql:ro
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-time-zone=+8:00
+    restart: unless-stopped
+    networks:
+      - echomind-network
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$${MYSQL_ROOT_PASSWORD:-root123} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
   # ── RabbitMQ 消息队列（体验券超时检测）───────────────────────────────────────
   rabbitmq:
     image: rabbitmq:4.0-management-alpine
@@ -81,6 +109,7 @@ services:
       - RABBITMQ_URL=amqp://${RABBITMQ_USER:-echomind}:${RABBITMQ_PASS:-echomind123}@rabbitmq:5672/
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
+      - MYSQL_URL=mysql://${MYSQL_USER:-echomind}:${MYSQL_PASS:-echomind123}@mysql:3306/echomind
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -88,6 +117,8 @@ services:
       redis:
         condition: service_healthy
       chromadb:
+        condition: service_healthy
+      mysql:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
@@ -135,5 +166,6 @@ networks:
 volumes:
   redis-data:
   chromadb-data:
+  mysql-data:
   rabbitmq-data:
   nginx-logs:
