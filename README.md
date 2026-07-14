@@ -17,7 +17,7 @@
 </p>
 
 ---
-![img.png](img.png)
+![img.png](static/img.png)
 
 ## 📋 目录
 
